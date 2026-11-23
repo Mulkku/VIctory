@@ -113,6 +113,22 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Gamepad buttons a debugging script holds (`VICTORY_PAD`).
+    fn scripted_buttons(&mut self) -> u32 {
+        0
+    }
+}
+
+/// Puts `buttons` (scripted) on the first pad the title sees: the first host
+/// pad, else the keyboard's stand-in.
+fn press_on_first_pad(
+    pads: &mut [Option<PadState>],
+    stand_in: Option<&mut PadState>,
+    buttons: u32,
+) {
+    if let Some(first) = pads.iter_mut().flatten().next().or(stand_in) {
+        first.buttons |= buttons;
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -401,12 +417,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.scripted_buttons())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, scripted);
         self.deliver(events);
     }
 
@@ -449,17 +465,19 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: u32,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        let mut stand_in = (!any_pad).then(|| fallback(&keys));
+        press_on_first_pad(&mut pads, stand_in.as_mut(), scripted);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
+        self.update(devices, FALLBACK, stand_in.map(Value::Pad), now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -1067,6 +1085,154 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Debugging aids behind `VICTORY_KEYS` and `VICTORY_PAD` (diagnostics
+/// builds): scripts of timed key and gamepad button presses.
+#[cfg(any(test, feature = "diagnostics"))]
+mod script {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// When a scripted press starts.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum When {
+        /// That long after input starts; held for [`HOLD`].
+        After(Duration),
+        /// At that presented frame; held for [`FRAME_HOLD`] frames (on the
+        /// software adapter one frame can outlast [`HOLD`]).
+        Frame(u64),
+    }
+
+    pub(super) const HOLD: Duration = Duration::from_millis(200);
+    pub(super) const FRAME_HOLD: u64 = 4;
+
+    /// `<when>:<name>,...`: `<when>` is seconds, or `f<n>` for the n-th
+    /// presented frame; entries whose name `name` does not know are
+    /// skipped.
+    fn parse<T>(list: &str, name: impl Fn(&str) -> Option<T>) -> Vec<(When, T)> {
+        list.split(',')
+            .filter_map(|entry| {
+                let (at, what) = entry.split_once(':')?;
+                let what = name(what.trim())?;
+                let at = at.trim();
+                let when = match at.strip_prefix('f') {
+                    Some(frame) => When::Frame(frame.parse().ok()?),
+                    None => When::After(Duration::try_from_secs_f64(at.parse().ok()?).ok()?),
+                };
+                Some((when, what))
+            })
+            .collect()
+    }
+
+    /// `VICTORY_KEYS`: a key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+    /// `Back`, `Up`, `Down`, `Left`, `Right` (virtual keys).
+    pub(super) fn keys(list: &str) -> Vec<(When, u8)> {
+        parse(list, |key| {
+            Some(match key {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            })
+        })
+    }
+
+    /// `VICTORY_PAD`: a button is `A`, `B`, `X`, `Y`, `Menu`, `View`, `Up`,
+    /// `Down`, `Left`, `Right`, `LB`, `RB`, `LS` or `RS` (stick clicks).
+    pub(super) fn buttons(list: &str) -> Vec<(When, u32)> {
+        parse(list, |button| {
+            Some(match button {
+                "A" => A,
+                "B" => B,
+                "X" => X,
+                "Y" => Y,
+                "Menu" => MENU,
+                "View" => VIEW,
+                "Up" => UP,
+                "Down" => DOWN,
+                "Left" => LEFT,
+                "Right" => RIGHT,
+                "LB" => LEFT_SHOULDER,
+                "RB" => RIGHT_SHOULDER,
+                "LS" => LEFT_STICK,
+                "RS" => RIGHT_STICK,
+                _ => return None,
+            })
+        })
+    }
+
+    /// What is held `now` after input started, `frame` frames presented.
+    pub(super) fn held<T: Copy>(script: &[(When, T)], now: Duration, frame: u64) -> Vec<T> {
+        script
+            .iter()
+            .filter(|&&(when, _)| match when {
+                When::After(at) => (at..at + HOLD).contains(&now),
+                When::Frame(at) => (at..at + FRAME_HOLD).contains(&frame),
+            })
+            .map(|&(_, what)| what)
+            .collect()
+    }
+
+    #[test]
+    fn scripted_keys_by_seconds_and_frames() {
+        let keys = keys("1.5:Enter, f100:x,f102:Down,bad,3:Nope,f:Enter");
+        assert_eq!(
+            keys,
+            [
+                (When::After(Duration::from_millis(1500)), 0x0D),
+                (When::Frame(100), b'X'),
+                (When::Frame(102), 0x28),
+            ]
+        );
+        let at = |ms, frame| held(&keys, Duration::from_millis(ms), frame);
+        assert_eq!(at(1499, 0), []);
+        assert_eq!(at(1600, 0), [0x0D]);
+        assert_eq!(at(1700, 0), []);
+        assert_eq!(at(0, 99), []);
+        assert_eq!(at(0, 100), [b'X']);
+        assert_eq!(at(0, 103), [b'X', 0x28]);
+        assert_eq!(at(0, 104), [0x28]);
+        assert_eq!(at(0, 106), []);
+    }
+
+    #[test]
+    fn scripted_buttons_parse() {
+        assert_eq!(
+            buttons("f10:A, 2:Menu,f12:RB,f13:Enter,x:A"),
+            [
+                (When::Frame(10), A),
+                (When::After(Duration::from_secs(2)), MENU),
+                (When::Frame(12), RIGHT_SHOULDER),
+            ]
+        );
+    }
+
+    #[test]
+    fn scripted_buttons_go_to_the_first_pad() {
+        let pad = |buttons| PadState {
+            buttons,
+            ..Default::default()
+        };
+        // A host pad in slot 1: it gets them, the stand-in is not there.
+        let mut pads = [None, Some(pad(B)), Some(pad(0)), None];
+        press_on_first_pad(&mut pads, None, A | MENU);
+        assert_eq!(pads, [None, Some(pad(B | A | MENU)), Some(pad(0)), None]);
+        // No host pad: the keyboard's stand-in gets them.
+        let mut pads = [None; PADS];
+        let mut stand_in = pad(X);
+        press_on_first_pad(&mut pads, Some(&mut stand_in), A);
+        assert_eq!((pads, stand_in), ([None; PADS], pad(X | A)));
+    }
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1134,7 +1300,7 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+            if keys_only() || self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
             let mut state = XINPUT_STATE::default();
@@ -1152,7 +1318,7 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            if focused() && !keys_only() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1182,45 +1348,50 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+
+        #[cfg(feature = "diagnostics")]
+        fn scripted_buttons(&mut self) -> u32 {
+            static SCRIPT: LazyLock<Vec<(script::When, u32)>> = LazyLock::new(|| {
+                script::buttons(&std::env::var("VICTORY_PAD").unwrap_or_default())
+            });
+            script::held(&SCRIPT, input_start().elapsed(), victory_gpu::queue::presented())
+                .into_iter()
+                .fold(0, |all, button| all | button)
+        }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS_ONLY=1` leaves out host pads and the
+    /// host keyboard, so only the scripts (`VICTORY_KEYS`, `VICTORY_PAD`)
+    /// reach the title and a scripted run does not depend on what is
+    /// plugged in or pressed meanwhile.
+    fn keys_only() -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            static ONLY: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("VICTORY_KEYS_ONLY").is_some_and(|v| v == "1"));
+            *ONLY
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        false
+    }
+
+    /// When input started (the first poll): scripts' seconds count from it.
+    #[cfg(feature = "diagnostics")]
+    fn input_start() -> Instant {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        *START
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=<when>:<key>,...` (see [`script::keys`])
+    /// holds each key at that time after input starts or at that presented
+    /// frame, with or without focus (the stand-in pad's table maps keys to
+    /// buttons). `VICTORY_PAD=<when>:<button>,...` ([`script::buttons`])
+    /// does the same for gamepad buttons, on the first pad the title sees.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        static SCRIPT: LazyLock<Vec<(script::When, u8)>> =
+            LazyLock::new(|| script::keys(&std::env::var("VICTORY_KEYS").unwrap_or_default()));
+        script::held(&SCRIPT, input_start().elapsed(), victory_gpu::queue::presented())
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

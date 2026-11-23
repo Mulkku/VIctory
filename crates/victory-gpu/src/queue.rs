@@ -227,8 +227,9 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Frames presented so far (diagnostics: scripted keys time by it).
 #[cfg(feature = "diagnostics")]
-pub(crate) fn presented() -> u64 {
+pub fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
