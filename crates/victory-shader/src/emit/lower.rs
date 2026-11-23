@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured, WaveJoin};
@@ -180,6 +180,8 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// Pixel inputs holding 16-bit values ([`half_inputs`]).
+    half_inputs: HashMap<u8, (bool, Option<u8>, bool)>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -283,23 +285,72 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
-/// `b` starts at the dword after `a`'s last channel.
-fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(u8, u8)> {
-    let extent = |r: u8| {
+/// `b` starts at the dword after `a`'s last channel; with `skip_unread`,
+/// elements of `a` the console program does not read take no room.
+fn packed_half(
+    elements: &[SigElement],
+    a: u8,
+    b: Option<u8>,
+    h: u8,
+    skip_unread: bool,
+) -> Option<(u8, u8)> {
+    let extent = |r: u8, skip: bool| {
         elements
             .iter()
-            .filter(|e| e.row == Some(u32::from(r)))
+            .filter(|e| e.row == Some(u32::from(r)) && (e.console_read || !skip))
             .map(|e| e.col + e.cols)
             .max()
     };
-    let na = extent(a)?;
+    let na = extent(a, skip_unread).unwrap_or(0);
     let a_halves = na.div_ceil(2) * 2;
     if h < a_halves {
         return (h < na).then_some((a, h));
     }
     let b = b?;
     let c = h - a_halves;
-    (c < extent(b)?).then_some((b, c))
+    (c < extent(b, false)?).then_some((b, c))
+}
+
+/// Pixel inputs of 16-bit values, per row: two per dword, the partner row
+/// and whether unread elements of the row take no room (see
+/// [`packed_half`]). The stage data names a partner other than the row
+/// itself; otherwise it is the next 16-bit row the program reads that no
+/// entry names, taken in row order (as for vertex outputs), and the pair
+/// was packed for this pixel shader: what it does not read is left out.
+fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>, bool)> {
+    let StageIo::Ps {
+        inputs: entries, ..
+    } = io
+    else {
+        return HashMap::new();
+    };
+    let named = |r: u8| {
+        entries
+            .iter()
+            .any(|i| i.row == r || (i.fp16 && i.pack2 && i.row2 != i.row && i.row2 == r))
+    };
+    let mut free: Vec<u8> = inputs
+        .iter()
+        .filter(|e| e.half && e.kind == 0 && e.console_read)
+        .filter_map(|e| u8::try_from(e.row?).ok())
+        .filter(|&r| !named(r))
+        .collect();
+    free.sort_unstable();
+    free.dedup();
+    let mut halves: Vec<_> = entries.iter().filter(|i| i.fp16).collect();
+    halves.sort_by_key(|i| i.row);
+    halves
+        .into_iter()
+        .map(|i| {
+            let implicit = i.pack2 && i.row2 == i.row;
+            let b = match (i.pack2, implicit) {
+                (false, _) => None,
+                (true, false) => Some(i.row2),
+                (true, true) => free.iter().position(|&r| r > i.row).map(|k| free.remove(k)),
+            };
+            (i.row, (i.pack2, b, implicit && b.is_some()))
+        })
+        .collect()
 }
 
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
@@ -361,8 +412,9 @@ impl<'a> Lower<'a> {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
+            // lane order (so do samples taking derivatives across quads); so
+            // do lane masks read as numbers, and LDS shared within one wave,
+            // where the console compiler leaves out barriers.
             // SGPR spills through VGPR lanes do not count: they are forwarded.
             console_lanes = p.blocks.iter().enumerate().any(|(b, block)| {
                 block.insts.iter().enumerate().any(|(i, inst)| {
@@ -493,6 +545,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -997,6 +1050,11 @@ impl<'a> Lower<'a> {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // VCC holds nothing on entry; a path that skips its
+                    // write reads it (read as zero, like unset VGPRs).
+                    None if matches!(reg, Reg::S(r) if r == VCC || r == VCC + 1) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -1087,6 +1145,7 @@ impl<'a> Lower<'a> {
                     cols: 1,
                     usage: 0,
                     half: false,
+                    console_read: true,
                 });
                 self.s.inputs.len() - 1
             }
@@ -5604,23 +5663,17 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             }
         };
-        let packing = match &self.x.native.io {
-            StageIo::Ps { inputs, .. } => inputs
-                .iter()
-                .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
-            _ => None,
-        };
+        let packing = self.half_inputs.get(&attribute.row).copied();
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
-            Some((pack2, b)) => {
+            Some((pack2, b, skip)) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, b, h)
+                        packed_half(&l.s.inputs, attribute.row, b, h, skip)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -6883,12 +6936,14 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
+        // A pixel's last export discards the lanes outside EXEC; any other
+        // export under a guard writes only the lanes the guard holds (a
+        // pixel output it skips stays undefined, where the console's keeps
+        // the target's value).
+        let kills = guard.is_some() && !mesh && e.done && self.s.pixel;
         if let Some(g) = guard
-            && !mesh
+            && kills
         {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
             self.s
@@ -6929,7 +6984,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, row, b, h)
+                        packed_half(outputs, row, b, h, false)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -7019,11 +7074,12 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
-            self.begin_guarded(guard)
-        } else {
+        // A lane writes where it exports (a mesh lane its own vertex or
+        // primitive).
+        let at = if kills {
             None
+        } else {
+            self.begin_guarded(guard)
         };
         let (name, opcode) = match (mesh, primitive) {
             (false, _) => ("storeOutput", 5),
@@ -7358,8 +7414,8 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Numeric, Parts, SigElement, buffer_format, half_inputs, lower, packed_half};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, PsInput, StageIo, Usage};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -7427,6 +7483,61 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+    fn half(row: u32, col: u8, cols: u8, console_read: bool) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: true,
+            console_read,
+        }
+    }
+
+    fn pixel(row: u8, row2: u8) -> StageIo {
+        StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row,
+                mask: 3,
+                attr: 0,
+                flat: false,
+                fp16: true,
+                pack2: true,
+                row2,
+            }],
+            input_addr: 2,
+            db_shader_control: 0,
+            patches: vec![],
+        }
+    }
+
+    #[test]
+    fn packed_pixel_halves_find_their_partner_row() {
+        // Row 0 holds a read xy and an unread zw; row 1, which no entry
+        // names, follows the read part: half 5 is its w.
+        let sig = [
+            half(0, 0, 2, true),
+            half(0, 2, 2, false),
+            half(1, 0, 4, true),
+        ];
+        let map = half_inputs(&pixel(0, 0), &sig);
+        assert_eq!(map[&0], (true, Some(1), true));
+        assert_eq!(packed_half(&sig, 0, Some(1), 1, true), Some((0, 1)));
+        assert_eq!(packed_half(&sig, 0, Some(1), 5, true), Some((1, 3)));
+        // A partner the stage data names follows the whole row, read or not.
+        let sig = [half(1, 0, 4, false), half(2, 0, 3, true)];
+        let map = half_inputs(&pixel(1, 2), &sig);
+        assert_eq!(map[&1], (true, Some(2), false));
+        assert_eq!(packed_half(&sig, 1, Some(2), 4, false), Some((2, 0)));
+        assert_eq!(packed_half(&sig, 1, Some(2), 7, false), None);
     }
 
     #[test]

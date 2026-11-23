@@ -21,7 +21,7 @@ pub struct Host {
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
     match c.part(fourcc) {
-        Some(p) => super::signature(p.data).map_err(|e| e.to_string()),
+        Some(p) => super::signature(p.data, fourcc == FourCC::ISG1).map_err(|e| e.to_string()),
         None => Ok(Vec::new()),
     }
 }
@@ -464,6 +464,7 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
             cols: 4,
             usage: 0,
             half: false,
+            console_read: true,
         });
     }
     Ok(stub(false, outputs))
@@ -482,6 +483,7 @@ pub fn stub_ps() -> HostShader {
         cols: 4,
         usage: 0,
         half: false,
+        console_read: true,
     };
     stub(true, vec![target])
 }

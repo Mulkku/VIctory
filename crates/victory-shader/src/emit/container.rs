@@ -22,6 +22,9 @@ pub(crate) struct SigElement {
     pub usage: u8,
     /// 16-bit on the console (declared 32-bit here).
     pub half: bool,
+    /// Inputs: the console program reads a component (the console
+    /// signature's read mask); outputs: always.
+    pub console_read: bool,
 }
 
 impl SigElement {
@@ -71,7 +74,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then by name offset
+    // (elements sharing a register keep element order otherwise).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -89,7 +93,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -360,6 +364,42 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_rows_sort_by_register_then_name() {
+        // Validator 1.6 orders by register, then by name offset: in a
+        // shared register the element listed first stays first, whatever
+        // its column.
+        let e = |name: &str, row, col, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+            console_read: true,
+        };
+        let part = signature(
+            &[
+                e("COLOR", 1, 3, 1),
+                e("TEXCOORD", 1, 0, 3),
+                e("TEXCOORD", 0, 0, 4),
+            ],
+            true,
+        );
+        let row = |k: usize| {
+            let at = 8 + 32 * k;
+            (
+                u32::from_le_bytes(part[at + 20..at + 24].try_into().unwrap()),
+                part[at + 24],
+            )
+        };
+        assert_eq!([row(0), row(1), row(2)], [(0, 0xF), (1, 0x8), (1, 0x7)]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

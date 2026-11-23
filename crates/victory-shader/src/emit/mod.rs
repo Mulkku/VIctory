@@ -223,19 +223,19 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+    let sig = |fourcc, input| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
-            Some(part) => signature(part.data),
+            Some(part) => signature(part.data, input),
             None => Ok(Vec::new()),
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = sig(FourCC::ISG1, true)?;
+    let mut outputs = sig(FourCC::OSG1, false)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -246,10 +246,45 @@ pub fn emit(
             _ => 0,
         };
     }
+    if pixel {
+        // The console packs the front face into a row of attributes; PC
+        // wants one mode per row, and the rasterizer makes the value, so it
+        // gets a row of its own.
+        let shared = |e: &container::SigElement, all: &[container::SigElement]| {
+            all.iter()
+                .any(|o| o.kind != 13 && o.row.is_some() && o.row == e.row)
+        };
+        let free = interpolated
+            .iter()
+            .filter_map(|e| e.row)
+            .max()
+            .map_or(0, |r| r + 1);
+        if let Some(id) = interpolated
+            .iter()
+            .position(|e| e.kind == 13 && shared(e, interpolated))
+        {
+            interpolated[id].row = Some(free);
+            interpolated[id].col = 0;
+        }
+    } else {
+        // Vertex and mesh outputs: one mode per row (PC packing). The pixel
+        // shader's inputs choose how values are interpolated.
+        uniform_rows(interpolated);
+    }
+    // Conservative depth (SV_DepthLessEqual, SV_DepthGreaterEqual) needs a
+    // centroid or sample position on PC, which moves SV_Position off the
+    // pixel center the console reads; plain depth keeps the console's
+    // values (only the early depth test is lost).
+    if pixel {
+        for e in outputs.iter_mut().filter(|e| matches!(e.kind, 18 | 19)) {
+            e.kind = 17;
+            e.name = "SV_Depth".into();
+        }
+    }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
+    let mut prims = sig(FourCC::PSG1, false)?;
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
         e.interp = 1;
@@ -304,8 +339,25 @@ pub fn emit(
     })
 }
 
+/// Elements sharing a row get one interpolation mode (constant where they
+/// differ), as PC signatures pack them.
+pub(crate) fn uniform_rows(elements: &mut [container::SigElement]) {
+    for i in 0..elements.len() {
+        let Some(row) = elements[i].row else {
+            continue;
+        };
+        let in_row = |e: &container::SigElement| e.row == Some(row);
+        let mode = elements[i].interp;
+        if elements.iter().any(|e| in_row(e) && e.interp != mode) {
+            for e in elements.iter_mut().filter(|e| in_row(e)) {
+                e.interp = 1;
+            }
+        }
+    }
+}
+
 /// The rows of an `ISG1`/`OSG1` part.
-fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+fn signature(part: &[u8], input: bool) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
@@ -317,9 +369,10 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             .get(name_at..)
             .and_then(|s| s.split(|&b| b == 0).next())
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
-        let mask = *part
-            .get(at + 24)
-            .ok_or(ShaderError::Malformed("truncated"))?;
+        let (mask, rw) = match part.get(at + 24..at + 26) {
+            Some(&[mask, rw]) => (mask, rw),
+            _ => return Err(ShaderError::Malformed("truncated")),
+        };
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -390,6 +443,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             cols: mask.count_ones().max(1) as u8,
             usage: 0,
             half: (4..=6).contains(&raw),
+            console_read: !input || rw != 0,
         });
     }
     Ok(out)
@@ -465,6 +519,7 @@ mod tests {
             cols: 4,
             usage: 15,
             half: false,
+            console_read: true,
         });
         let b = s.entry;
         for (c, v) in [1.0f32, 0.5, 0.25, 1.0].into_iter().enumerate() {
@@ -478,6 +533,27 @@ mod tests {
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
         s.finish()
+    }
+
+    #[test]
+    fn rows_mixing_modes_become_constant() {
+        let e = |row, col, interp| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 0,
+            half: false,
+            console_read: true,
+        };
+        let mut sig = [e(0, 0, 2), e(0, 1, 1), e(1, 0, 2), e(1, 1, 2)];
+        super::uniform_rows(&mut sig);
+        let modes: Vec<u8> = sig.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 2, 2]);
     }
 
     #[test]
@@ -588,6 +664,7 @@ mod tests {
             cols: 1,
             usage: 0,
             half: false,
+            console_read: true,
         };
         let isg1 = super::container::signature(&[w_only], true);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
