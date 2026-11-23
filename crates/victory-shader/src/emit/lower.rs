@@ -6071,7 +6071,12 @@ impl<'a> Lower<'a> {
                                 return Err("an image result");
                             };
                             let ch = dmask.trailing_zeros();
-                            let r = self.gather_level(h, &cs, &os, lod, kind, ch)?;
+                            // The texel loads follow the sampler's address
+                            // modes, which only a static sampler fixes here.
+                            let (Source::Constant(words), true) = (ss, alts.is_empty()) else {
+                                return Err("a gather from a computed level with a heap sampler");
+                            };
+                            let r = self.gather_level(h, &cs, &os, lod, kind, ch, words)?;
                             for (k, x) in r.into_iter().enumerate() {
                                 self.write(inst, Reg::V(reg + k as u8), x, guard);
                             }
@@ -6189,9 +6194,9 @@ impl<'a> Lower<'a> {
     /// `image_gather4_l` at a computed level, which DXIL's gather cannot
     /// take: channel `ch` of the four texels a bilinear sample at the
     /// nearest level would read, through texel loads, in gather order
-    /// (i0,j1), (i1,j1), (i1,j0), (i0,j0). The register results.
-    // shortcut: texels past the edge are clamped (the sampler's address
-    // mode is not followed).
+    /// (i0,j1), (i1,j1), (i1,j0), (i0,j0), each placed by the static
+    /// sampler's (`words`) address mode per axis. The register results.
+    #[allow(clippy::too_many_arguments)]
     fn gather_level(
         &mut self,
         h: V,
@@ -6200,6 +6205,7 @@ impl<'a> Lower<'a> {
         lod: V,
         kind: u32,
         ch: u32,
+        words: &[u32],
     ) -> Result<[V; 4], Why> {
         if !matches!(kind, 2 | 7) {
             return Err("a gather from a computed level outside 2D");
@@ -6227,8 +6233,9 @@ impl<'a> Lower<'a> {
         let d = self
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
-        // Per axis: the first texel (offset applied), then both clamped.
-        let mut pairs = [[zero; 2]; 2];
+        // Per axis: both texels after the address mode, and whether each
+        // lies inside (border mode only).
+        let mut pairs = [[(zero, None); 2]; 2];
         for (k, pair) in pairs.iter_mut().enumerate() {
             let n = self.s.m.extract(c, d, k as u32);
             let nf = self.s.m.cast(c, Cast::UiToFp, n, f32t);
@@ -6243,10 +6250,44 @@ impl<'a> Lower<'a> {
             for (e, slot) in pair.iter_mut().enumerate() {
                 let at = self.s.m.i32(e as u32);
                 let t = self.s.m.bin(c, Bin::Add, i, at);
+                // `x` modulo `m`, made non-negative.
+                let modulo = |l: &mut Self, x: V, m: V| {
+                    let r = l.s.m.bin(c, Bin::SRem, x, m);
+                    let neg = l.s.m.cmp(c, pred::SLT, r, zero);
+                    let up = l.s.m.bin(c, Bin::Add, r, m);
+                    l.s.m.select(c, neg, up, r)
+                };
+                let t = match modes[k] {
+                    0 => modulo(self, t, n),
+                    1 => {
+                        // Period 2n, the second half reflected.
+                        let two_n = self.s.m.bin(c, Bin::Add, n, n);
+                        let m = modulo(self, t, two_n);
+                        let back = self.s.m.bin(c, Bin::Sub, two_n, one);
+                        let back = self.s.m.bin(c, Bin::Sub, back, m);
+                        let low = self.s.m.cmp(c, pred::SLT, m, n);
+                        self.s.m.select(c, low, m, back)
+                    }
+                    3 => {
+                        // Reflected once about 0, then clamped.
+                        let neg = self.s.m.cmp(c, pred::SLT, t, zero);
+                        let minus = self.s.m.i32(u32::MAX);
+                        let r = self.s.m.bin(c, Bin::Sub, minus, t);
+                        self.s.m.select(c, neg, r, t)
+                    }
+                    _ => t,
+                };
+                if modes[k] == 6 {
+                    let below = self.s.m.cmp(c, pred::SLT, t, zero);
+                    let above = self.s.m.cmp(c, pred::SGT, t, top);
+                    let out = self.s.m.bin(c, Bin::Or, below, above);
+                    slot.1 = Some(out);
+                }
+                // Clamped (a no-op after wrap and mirror).
                 let low = self.s.m.cmp(c, pred::SLT, t, zero);
                 let t = self.s.m.select(c, low, zero, t);
                 let high = self.s.m.cmp(c, pred::SGT, t, top);
-                *slot = self.s.m.select(c, high, top, t);
+                slot.0 = self.s.m.select(c, high, top, t);
             }
         }
         let slice = if kind == 7 {
@@ -6255,6 +6296,7 @@ impl<'a> Lower<'a> {
         } else {
             iu
         };
+        let border = self.s.m.f32(border.to_bits());
         let [[i0, i1], [j0, j1]] = pairs;
         Ok([(i0, j1), (i1, j1), (i1, j0), (i0, j0)].map(|(x, y)| {
             let r = self.s.op(

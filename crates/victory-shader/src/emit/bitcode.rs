@@ -59,6 +59,7 @@ pub(crate) enum Bin {
     Mul = 2,
     UDiv = 3,
     SDiv = 4,
+    SRem = 6,
     URem = 5,
     Shl = 7,
     LShr = 8,
