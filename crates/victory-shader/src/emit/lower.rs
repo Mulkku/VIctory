@@ -3257,8 +3257,10 @@ impl<'a> Lower<'a> {
             // Root parameters: user data, read where the code uses them.
             for &(_, w) in &inst.writes {
                 if !self.params.contains_key(&w) {
-                    self.vals
-                        .insert(w, Val::Missing("a spilled user-data dword no parameter has"));
+                    self.vals.insert(
+                        w,
+                        Val::Missing("a spilled user-data dword no parameter has"),
+                    );
                 }
             }
             return Ok(());
@@ -3405,7 +3407,12 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err(SCALAR_DATA),
         };
-        // How the program uses the descriptor tells the view's kind.
+        // How the program uses the descriptor tells the view's kind: this
+        // load's, or one of the same address (the compiler loads a
+        // descriptor again on each path to a join).
+        let here = self.scalar.get(&site).copied();
+        let same =
+            |load: Site| load == site || here.is_some_and(|a| self.scalar.get(&load) == Some(&a));
         let use_at = self
             .x
             .res
@@ -3414,7 +3421,7 @@ impl<'a> Lower<'a> {
             .filter(|d| d.role == Role::Resource)
             .find_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                    Source::Loaded { load, first } if same(load) => Some((d.site, first)),
                     _ => None,
                 })
             });
@@ -3600,7 +3607,11 @@ impl<'a> Lower<'a> {
             let x = if constant {
                 self.cbuffer_dword(h, at)
             } else {
-                let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+                let (u, mask, al) = (
+                    self.s.m.undef(self.s.t.i32),
+                    self.s.m.i8(1),
+                    self.s.m.i32(4),
+                );
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",

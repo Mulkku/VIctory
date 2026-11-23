@@ -637,7 +637,8 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let (param, _) = self.user[base.0 as usize].ok_or("an address not from a root parameter")?;
+        let (param, _) =
+            self.user[base.0 as usize].ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => High::Zero,
             RootType::Descriptor => High::Param(param),
@@ -663,7 +664,9 @@ impl<'a> Tracer<'a> {
         match high {
             High::Zero => t == Term::Const(0),
             High::Value(h) => t == Term::Value(h),
-            High::Param(p) => matches!(t, Term::Value(v) if self.user[v.0 as usize] == Some((p, 1))),
+            High::Param(p) => {
+                matches!(t, Term::Value(v) if self.user[v.0 as usize] == Some((p, 1)))
+            }
         }
     }
 
@@ -854,9 +857,35 @@ impl<'a> Tracer<'a> {
                     .collect();
                 self.classify(&edge, joins)
             })
-            .collect::<Result<_, _>>();
+            .collect::<Result<Vec<_>, _>>();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        let args = args?;
+        // The same descriptor loaded again on each path (same address, no
+        // computed term): one load stands for all.
+        let address = |s: &Source| match *s {
+            Source::Loaded { load, first } => {
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } = &self.inst(load).fields
+                else {
+                    return None;
+                };
+                let a = self
+                    .smem_address(self.inst(load), base, *offset, soffset)
+                    .ok()?;
+                a.dynamic.is_none().then_some((a, first))
+            }
+            _ => None,
+        };
+        if let Some(first) = args.first().and_then(address)
+            && args.iter().all(|s| address(s) == Some(first))
+        {
+            return Ok(args.into_iter().next());
+        }
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// `v` as some other dword with constant bits set.
@@ -1294,6 +1323,33 @@ mod tests {
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn one_descriptor_loaded_on_both_paths_is_one_source() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0003, // s_cbranch_scc1 -> 0x1c
+                0xF408_0001,
+                0xFA00_0010, // s_load_dwordx4 s[0:3], s[2:3], 0x10
+                0xBF82_0002, // s_branch -> 0x24
+                0xF408_0001,
+                0xFA00_0010, // 0x1c: s_load_dwordx4 s[0:3], s[2:3], 0x10
+                0xF420_0100,
+                0xFA00_0000, // 0x24: s_buffer_load_dword s4, s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Loaded { load, first: 0 } = r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!(a, at(0, 0x10));
     }
 
     #[test]
