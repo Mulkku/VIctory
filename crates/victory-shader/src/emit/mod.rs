@@ -59,6 +59,11 @@
 //!   atomically is declared a 32-bit unsigned single-channel view; the
 //!   host's view at that index must be an R32 integer view (64-bit atomics
 //!   stop the translation). Global loads from a root SRV read it raw.
+//! * **Barycentrics read as data** (added 2026-11-24): the console's i and
+//!   j of a pixel are the weights of vertices 1 and 2; read other than by
+//!   interpolation, they become `SV_Barycentrics` channels y and z (one
+//!   input per interpolation mode, two at most), which needs
+//!   `BarycentricsSupported` (options 3). Interpolation alone declares none.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -89,6 +94,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -404,6 +411,7 @@ fn signature(part: &[u8], input: bool) -> Result<Vec<container::SigElement>, Sha
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {

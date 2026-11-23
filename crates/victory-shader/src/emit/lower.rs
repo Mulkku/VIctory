@@ -157,6 +157,9 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Barycentric input VGPRs read as data, loaded (as `SV_Barycentrics`)
+    /// on first use: interpolation alone needs no such input.
+    barycentrics: HashMap<Value, Input>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -385,6 +388,19 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// The DXIL interpolation mode of a console barycentric pair.
+fn interp_mode(b: Barycentric) -> Result<u8, Why> {
+    Ok(match b {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
+    })
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -534,6 +550,7 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            barycentrics: HashMap::new(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -1059,6 +1076,10 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&input @ Input::Barycentric { .. }) => {
+                        self.barycentrics.insert(v, input);
+                        continue;
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1081,7 +1102,16 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            // The console's i and j: an attribute is P0 + i (P1 - P0) +
+            // j (P2 - P0), so they are the weights of vertices 1 and 2,
+            // channels y and z of `SV_Barycentrics` (P0 is the provoking
+            // vertex, vertex 0 to D3D as well).
+            Input::Barycentric { kind, index } => {
+                return match interp_mode(kind).and_then(|m| self.barycentrics_input(m)) {
+                    Ok(id) => self.load_any_input(id, index + 1),
+                    Err(w) => Val::Missing(w),
+                };
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1225,6 +1255,40 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The `SV_Barycentrics` input interpolated with DXIL mode `mode`, added
+    /// on first use. DXIL allows two: one with perspective, one without.
+    fn barycentrics_input(&mut self, mode: u8) -> Result<usize, Why> {
+        const KIND: u8 = 28;
+        let linear = |m: u8| matches!(m, 4 | 5 | 7);
+        let same = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == KIND && linear(e.interp) == linear(mode));
+        if let Some(id) = same {
+            return if self.s.inputs[id].interp == mode {
+                Ok(id)
+            } else {
+                Err("barycentrics of two modes with the same perspective")
+            };
+        }
+        let index = self.s.inputs.iter().filter(|e| e.kind == KIND).count() as u32;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.s.inputs.push(SigElement {
+            name: "SV_Barycentrics".into(),
+            index,
+            kind: KIND,
+            comp: 9,
+            interp: mode,
+            row: None,
+            col: 0,
+            cols: 3,
+            usage: 0,
+            half: false,
+        });
+        Ok(self.s.inputs.len() - 1)
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -1238,6 +1302,14 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
+        }
+        if let Some(&input) = self.barycentrics.get(&v) {
+            let val = self.input(input);
+            self.vals.insert(v, val);
+            return match val {
+                Val::Missing(w) => Err(w),
+                val => Ok(val),
+            };
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -5621,18 +5693,7 @@ impl<'a> Lower<'a> {
                 attribute,
                 barycentric,
                 ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
+            } => (attribute, interp_mode(*barycentric)?),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
@@ -7341,6 +7402,10 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                // A barycentric input reaching a phi that is read is read.
+                if self.read_phis.contains(&phi.value) && self.barycentrics.contains_key(&arg) {
+                    let _ = self.get(arg);
+                }
                 let val = self.vals.get(&arg).copied();
                 let dead = self.x.st.dead_mask_edges.contains(&(phi.value, n));
                 let is_mask =
