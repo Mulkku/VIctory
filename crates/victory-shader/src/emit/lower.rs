@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
@@ -185,6 +185,9 @@ struct Lower<'a> {
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
     /// Pixel inputs holding 16-bit values ([`half_inputs`]).
     half_inputs: HashMap<u8, (bool, Option<u8>, bool)>,
+    /// Pixel input rows declared constant, interpolated by hand
+    /// ([`manual_rows`]).
+    manual_rows: HashSet<u8>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -356,6 +359,67 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
         .collect()
 }
 
+/// Pixel input rows read more than one way (interpolation modes, flat,
+/// halves taken as they stand) or holding integers next to interpolated
+/// values: PC wants one mode per row, so those rows are declared constant
+/// and their interpolated reads computed from the vertices and the
+/// barycentrics. Rows read one way get that mode.
+fn manual_rows(
+    io: &Io,
+    halves: &HashMap<u8, (bool, Option<u8>, bool)>,
+    inputs: &mut [SigElement],
+) -> HashSet<u8> {
+    let attribute_row = |e: &SigElement| matches!(e.kind, 0 | 6 | 7);
+    // Per row the modes reads want; none for a half taken as it stands.
+    let mut modes: HashMap<u8, Vec<Option<u8>>> = HashMap::new();
+    for (_, interp) in &io.interps {
+        let (attribute, mode) = match *interp {
+            Interp::Interpolated {
+                attribute,
+                barycentric,
+                ..
+            } => match interp_mode(barycentric) {
+                Ok(m) => (attribute, Some(m)),
+                Err(_) => continue,
+            },
+            Interp::Vertex {
+                attribute,
+                vertex: 2,
+            } => (attribute, Some(1)),
+            Interp::Vertex { .. } => continue,
+            Interp::Raw { attribute, .. } => (attribute, None),
+        };
+        let partner = halves.get(&attribute.row).and_then(|h| h.1);
+        for row in std::iter::once(attribute.row).chain(partner) {
+            modes.entry(row).or_default().push(mode);
+        }
+    }
+    for e in inputs.iter().filter(|e| attribute_row(e) && e.comp != 9) {
+        if let Some(row) = e.row.and_then(|r| u8::try_from(r).ok()) {
+            modes.entry(row).or_default().push(Some(1));
+        }
+    }
+    let mut manual = HashSet::new();
+    for (row, mut wanted) in modes {
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mode = match wanted[..] {
+            [Some(m)] => m,
+            _ => {
+                manual.insert(row);
+                1
+            }
+        };
+        for e in inputs
+            .iter_mut()
+            .filter(|e| attribute_row(e) && e.row == Some(u32::from(row)))
+        {
+            e.interp = mode;
+        }
+    }
+    manual
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
@@ -416,6 +480,11 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
+        let halves = half_inputs(&x.native.io, &x.inputs);
+        let manual_rows = match x.native.stage {
+            HwStage::Ps => manual_rows(x.io, &halves, &mut s.inputs),
+            _ => HashSet::new(),
+        };
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
@@ -562,7 +631,8 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            half_inputs: half_inputs(&x.native.io, &x.inputs),
+            half_inputs: halves,
+            manual_rows,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1285,6 +1355,7 @@ impl<'a> Lower<'a> {
             cols: 3,
             usage: 0,
             half: false,
+            console_read: true,
         });
         Ok(self.s.inputs.len() - 1)
     }
@@ -5700,6 +5771,7 @@ impl<'a> Lower<'a> {
                 vertex: 2,
             } => (attribute, 1),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            &Interp::Raw { attribute, second } => return self.interp_raw(inst, attribute, second),
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -5709,11 +5781,15 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
-        // A channel of an input element, interpolated as `mode` says.
+        // A channel of an input element, interpolated as `mode` says (by
+        // hand in a row declared constant).
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
             let (id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
+            if mode != 1 && l.manual_rows.contains(&row) {
+                return l.interpolated_at_vertices(id, col, mode);
+            }
             let e = &mut l.s.inputs[id];
             if e.interp != mode && e.usage != 0 {
                 return Err("one input interpolated two ways");
@@ -5789,6 +5865,129 @@ impl<'a> Lower<'a> {
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
         self.s.m.bin(c, Bin::Or, old, x)
+    }
+
+    /// Channel `col` of input element `id` at vertex `k` (an input of a
+    /// constant row, see [`manual_rows`]).
+    fn attribute_at_vertex(&mut self, id: usize, col: u8, k: u8) -> Result<V, Why> {
+        let e = &mut self.s.inputs[id];
+        if e.comp != 9 {
+            return Err("an integer input interpolated");
+        }
+        e.usage |= 1 << col;
+        self.s.flags |= flags::BARYCENTRICS;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i8(k),
+        ];
+        let (entry, f32t) = (self.s.entry, self.s.t.f32);
+        Ok(self.s.op(
+            entry,
+            "attributeAtVertex.f32",
+            Attr::ReadNone,
+            f32t,
+            137,
+            &args,
+        ))
+    }
+
+    /// Channel `col` of input element `id` interpolated with DXIL mode
+    /// `mode` from its three vertices and the barycentrics, as the console
+    /// computes it: P0 + P10 × i + P20 × j.
+    fn interpolated_at_vertices(&mut self, id: usize, col: u8, mode: u8) -> Result<V, Why> {
+        let b = self.barycentrics_input(mode)?;
+        let mut ij = [None; 2];
+        for (k, slot) in ij.iter_mut().enumerate() {
+            let Val::I32(x) = self.load_any_input(b, k as u8 + 1) else {
+                return Err("an input");
+            };
+            *slot = Some(self.as_float(x));
+        }
+        let [Some(i), Some(j)] = ij else {
+            unreachable!()
+        };
+        let p0 = self.attribute_at_vertex(id, col, 0)?;
+        let p1 = self.attribute_at_vertex(id, col, 1)?;
+        let p2 = self.attribute_at_vertex(id, col, 2)?;
+        let c = self.cur;
+        let p10 = self.s.m.bin(c, Bin::Sub, p1, p0);
+        let p20 = self.s.m.bin(c, Bin::Sub, p2, p0);
+        let x = self.fmad(p10, i, p0);
+        let x = self.fmad(p20, j, x);
+        Ok(self.as_int(x))
+    }
+
+    /// One half of an interpolation as it stands ([`Interp::Raw`]): the
+    /// first P0 + P10 × i, the second acc + P20 × j, with i, j and acc what
+    /// the instruction reads.
+    fn interp_raw(&mut self, inst: &Inst, attribute: Attribute, second: bool) -> Result<(), Why> {
+        let f16 = inst.name().ends_with("_f16");
+        // The element channel holding the value, as in `interp`.
+        let (row, ch) = match self.half_inputs.get(&attribute.row).copied() {
+            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
+            None => (attribute.row, attribute.channel),
+            Some(_) if !f16 => return Err("32-bit interpolation of a 16-bit input"),
+            Some((pack2, b, skip)) => {
+                let h = 2 * attribute.channel + u8::from(attribute.high);
+                if pack2 {
+                    packed_half(&self.s.inputs, attribute.row, b, h, skip)
+                } else {
+                    h.is_multiple_of(2).then_some((attribute.row, h / 2))
+                }
+                .ok_or("a packed input half no element holds")?
+            }
+        };
+        let (id, col) = self
+            .find_input(row, ch)
+            .ok_or("an input the signature lacks")?;
+        // Destination, barycentric and accumulator registers.
+        let (dst, bary, acc) = match &inst.fields {
+            Fields::Vintrp {
+                dst: Operand::Vector { reg: d, .. },
+                src: Operand::Vector { reg: s, .. },
+                ..
+            } => (*d, *s, *d),
+            Fields::Valu(v) => match (v.dst, v.src.get(1), v.src.get(2)) {
+                (
+                    Some(Operand::Vector { reg: d, .. }),
+                    Some(&Operand::Vector { reg: s, .. }),
+                    acc,
+                ) => {
+                    let acc = match acc {
+                        Some(&Operand::Vector { reg, .. }) => reg,
+                        _ if second => return Err("an interpolation operand"),
+                        _ => d,
+                    };
+                    (d, s, acc)
+                }
+                _ => return Err("an interpolation operand"),
+            },
+            _ => return Err("an interpolation operand"),
+        };
+        let read = |l: &mut Self, reg: u8| -> Result<V, Why> {
+            let v = inst.read(Reg::V(reg)).ok_or("an interpolation operand")?;
+            let x = l.i32_of(v)?;
+            Ok(l.as_float(x))
+        };
+        let bary = read(self, bary)?;
+        let p0 = self.attribute_at_vertex(id, col, 0)?;
+        let pk = self.attribute_at_vertex(id, col, if second { 2 } else { 1 })?;
+        let base = if second { read(self, acc)? } else { p0 };
+        let delta = self.s.m.bin(self.cur, Bin::Sub, pk, p0);
+        let x = self.fmad(delta, bary, base);
+        let x = if f16 && second {
+            let i32t = self.s.t.i32;
+            let h = self
+                .s
+                .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]);
+            self.low_half(inst, dst, h)
+        } else {
+            self.as_int(x)
+        };
+        self.write(inst, Reg::V(dst), x, None);
+        Ok(())
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -6141,6 +6340,9 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // Only the spatial coordinates (no array slice) count.
+                let mut lc = [fu; 3];
+                lc[..spatial.min(3)].copy_from_slice(&cs[..spatial.min(3)]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -6149,7 +6351,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lc[0], lc[1], lc[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);

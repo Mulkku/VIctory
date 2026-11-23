@@ -138,6 +138,12 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// One half of the hardware's formula on the operands as they stand:
+    /// the first (`v_interp_p1*`) is P0 + P10 × i, the second
+    /// (`v_interp_p2*`) acc + P20 × j. For barycentrics the program
+    /// computes, a second half whose accumulator is no first half's
+    /// result, and first halves read as more than an accumulator.
+    Raw { attribute: Attribute, second: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,11 +319,32 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .map(move |(i, phi)| (phi.value, (b, i)))
         })
         .collect();
+    // Readers of each value (pixel programs): instructions, and phis by
+    // their value.
+    let mut users: std::collections::HashMap<Value, Vec<Site>> = Default::default();
+    let mut phi_users: std::collections::HashMap<Value, Vec<Value>> = Default::default();
+    let pixel = native.stage == HwStage::Ps;
+    for (b, block) in p.blocks.iter().enumerate().filter(|_| pixel) {
+        for phi in &block.phis {
+            for &a in &phi.args {
+                phi_users.entry(a).or_default().push(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.reads {
+                users.entry(v).or_default().push((b, i));
+            }
+        }
+    }
     let halves = Halves {
         p,
         defs: &defs,
         phis: &phis,
+        users: &users,
+        phi_users: &phi_users,
     };
+    let mut first_halves = Vec::new();
+    let mut raw_firsts = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -331,27 +358,26 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
                             // The first half's result is this one's old dst.
+                            let acc = inst.read(Reg::V(d));
                             let interp = halves
-                                .pair(
-                                    attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
-                                    &barycentric,
-                                )
-                                .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                                .pair(attr, acc, inst.read(Reg::V(reg)), &barycentric)
+                                .map(|pair| pair.with(attribute))
+                                .unwrap_or_else(|_| halves.raw(acc, attribute, &mut raw_firsts));
+                            io.interps.push((site, interp));
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -360,8 +386,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         };
                         let interp = halves
                             .pair(&v.src[0], read(2), read(1), &barycentric)
-                            .map_err(|what| unsupported(at, what))?;
-                        io.interps.push((site, interp.with(attribute)));
+                            .map(|pair| pair.with(attribute))
+                            .unwrap_or_else(|_| halves.raw(read(2), attribute, &mut raw_firsts));
+                        io.interps.push((site, interp));
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
@@ -409,6 +436,19 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // First halves whose result is more than a second half's accumulator
+    // (or feeds a raw second half) are evaluated as they stand.
+    for (site, attribute) in first_halves {
+        if raw_firsts.contains(&site) || !halves.only_completed(site) {
+            io.interps.push((
+                site,
+                Interp::Raw {
+                    attribute,
+                    second: false,
+                },
+            ));
+        }
+    }
     Ok(io)
 }
 
@@ -453,9 +493,86 @@ struct Halves<'a> {
     p: &'a Program,
     defs: &'a std::collections::HashMap<Value, Site>,
     phis: &'a std::collections::HashMap<Value, (usize, usize)>,
+    users: &'a std::collections::HashMap<Value, Vec<Site>>,
+    phi_users: &'a std::collections::HashMap<Value, Vec<Value>>,
 }
 
 impl Halves<'_> {
+    /// A second half [`Halves::pair`] refuses, evaluated as it stands; the
+    /// first halves its accumulator `acc` comes from join `raw_firsts`.
+    fn raw(&self, acc: Option<Value>, attribute: Attribute, raw_firsts: &mut Vec<Site>) -> Interp {
+        let mut from = Vec::new();
+        if let Some(acc) = acc {
+            self.reaching(acc, &mut Vec::new(), &mut from);
+        }
+        for (b, i) in from {
+            let name = self.p.blocks[b].insts[i].name();
+            if matches!(name, "v_interp_p1_f32" | "v_interp_p1ll_f16")
+                && !raw_firsts.contains(&(b, i))
+            {
+                raw_firsts.push((b, i));
+            }
+        }
+        Interp::Raw {
+            attribute,
+            second: true,
+        }
+    }
+
+    /// The instructions `v` comes from, through phis (none for inputs).
+    fn reaching(&self, v: Value, seen: &mut Vec<Value>, out: &mut Vec<Site>) {
+        if let Some(&site) = self.defs.get(&v) {
+            if !out.contains(&site) {
+                out.push(site);
+            }
+        } else if let Some(&(b, i)) = self.phis.get(&v)
+            && !seen.contains(&v)
+        {
+            seen.push(v);
+            for &a in &self.p.blocks[b].phis[i].args {
+                self.reaching(a, seen, out);
+            }
+        }
+    }
+
+    /// Whether the first half at `site` is read only as the accumulator of
+    /// second halves (through phis).
+    fn only_completed(&self, (b, i): Site) -> bool {
+        let inst = &self.p.blocks[b].insts[i];
+        inst.writes
+            .iter()
+            .all(|&(_, v)| self.completes(v, &mut Vec::new()))
+    }
+
+    fn completes(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        let acc_of = |&(b, i): &Site| {
+            let u = &self.p.blocks[b].insts[i];
+            let acc = match &u.fields {
+                Fields::Vintrp {
+                    dst: Operand::Vector { reg, .. },
+                    ..
+                } if u.name() == "v_interp_p2_f32" => Some(*reg),
+                Fields::Valu(val) if u.name() == "v_interp_p2_f16" => match val.src.get(2) {
+                    Some(&Operand::Vector { reg, .. }) => Some(reg),
+                    _ => None,
+                },
+                _ => None,
+            };
+            acc.is_some_and(|r| u.reads.iter().all(|x| x.1 != v || x.0 == Reg::V(r)))
+        };
+        self.users.get(&v).into_iter().flatten().all(acc_of)
+            && self
+                .phi_users
+                .get(&v)
+                .into_iter()
+                .flatten()
+                .all(|&w| self.completes(w, seen))
+    }
+
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
     /// must read the same attribute channel and the same kind's i.
@@ -618,13 +735,52 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_or_unknown_interpolation_fails() {
-        // p2 alone: its old dst is no p1's result.
-        let lone = program(&[0xC809_0001, S_ENDPGM]); // v_interp_p2_f32 v2, v1, attr0.x
-        assert!(raise(&lone, &pixel(vec![TEXCOORD], 2)).is_err());
+    fn unknown_interpolation_fails() {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn halves_without_a_pair_stand_alone() {
+        let raw = |second| Interp::Raw {
+            attribute: Attribute {
+                usage: Usage::Generic,
+                row: 1,
+                channel: 0,
+                high: false,
+            },
+            second,
+        };
+        let interps = |words: &[u32]| {
+            let p = program(words);
+            raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap().interps
+        };
+        // p2 alone: its old dst is no p1's result.
+        assert_eq!(
+            interps(&[0xC809_0001, S_ENDPGM]), // v_interp_p2_f32 v2, v1, attr0.x
+            [((0, 0), raw(true))]
+        );
+        // j is computed (a copy of i): both halves as they stand.
+        assert_eq!(
+            interps(&[
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0x7E02_0300, // v_mov_b32 v1, v0
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                S_ENDPGM,
+            ]),
+            [((0, 2), raw(true)), ((0, 0), raw(false))]
+        );
+        // A first half exported itself.
+        assert_eq!(
+            interps(&[
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xF800_180F,
+                0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+                S_ENDPGM,
+            ]),
+            [((0, 0), raw(false))]
+        );
     }
 
     #[test]

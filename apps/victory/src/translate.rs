@@ -543,8 +543,11 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
     for (_, i) in &r.interps {
         match i {
-            io::Interp::Interpolated { .. } => t.interpolated += 1,
+            io::Interp::Interpolated { .. } | io::Interp::Raw { second: true, .. } => {
+                t.interpolated += 1
+            }
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Raw { .. } => {}
         }
     }
     for e in &r.exports {

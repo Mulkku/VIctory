@@ -27,6 +27,7 @@ fn element(name: &str, kind: u8, row: u32) -> SigElement {
         cols: 4,
         usage: 0,
         half: false,
+        console_read: true,
     }
 }
 
