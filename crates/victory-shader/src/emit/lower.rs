@@ -242,6 +242,14 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// Image samples taking implicit derivatives (with or without a bias).
+fn implicit_derivatives(name: &str) -> bool {
+    matches!(
+        name.strip_suffix("_o").unwrap_or(name),
+        "image_sample" | "image_sample_b"
+    )
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -361,6 +369,7 @@ impl<'a> Lower<'a> {
                             || n.contains("permute")
                             || n.starts_with("v_permlane")
                             || n.starts_with("v_mbcnt")
+                            || implicit_derivatives(n)
                             || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                             || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
                             || reads_mask_as_data(x.st, inst))
@@ -1962,6 +1971,33 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Coarse gradients of the first `axes` of `cs` across this lane's quad
+    /// (x: lane 1 less lane 0, y: lane 2 less lane 0), each times `scale`:
+    /// `sampleGrad`'s six, x then y.
+    fn quad_gradients(&mut self, cs: &[V], axes: usize, scale: Option<V>) -> Result<Vec<V>, Why> {
+        self.cross_lane(true)?;
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let mut g = vec![self.s.m.undef(f32t); 6];
+        for (k, &x) in cs.iter().enumerate().take(axes) {
+            let mut at = [x; 3];
+            for (lane, v) in at.iter_mut().enumerate() {
+                let l = self.s.m.i32(lane as u32);
+                *v = self
+                    .s
+                    .op(c, "quadReadLaneAt.f32", Attr::NoUnwind, f32t, 122, &[x, l]);
+            }
+            for (row, other) in [(0, at[1]), (3, at[2])] {
+                let d = self.s.m.bin(c, Bin::Sub, other, at[0]);
+                g[row + k] = match scale {
+                    Some(s) => self.s.m.bin(c, Bin::Mul, d, s),
+                    None => d,
+                };
+            }
+        }
+        Ok(g)
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -2381,11 +2417,6 @@ impl<'a> Lower<'a> {
 
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
-    }
-
-    /// `v` is a dword of a lane mask (low or high).
-    fn holds_mask(&self, v: Value) -> bool {
-        self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)
     }
 
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
@@ -5995,6 +6026,34 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             let r = match op {
+                // Outside pixel code the console still takes implicit
+                // derivatives across each quad of lanes (lanes 4k to 4k + 3:
+                // the first one's neighbours in x, then y). With console
+                // lanes the host's quad reads see the same quads; the
+                // sample takes those gradients (a bias scales them by its
+                // power of two).
+                60 | 61 if !self.s.pixel => {
+                    let scale = if op == 61 {
+                        let bias = addr_val(self, at(usize::from(offset_word)))?;
+                        let bias = to_float(self, bias);
+                        Some(self.unary(21, bias))
+                    } else {
+                        None
+                    };
+                    let axes = if kind == 5 { 3 } else { spatial };
+                    let g = self.quad_gradients(&cs, axes, scale)?;
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(fu);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(fu);
@@ -7162,12 +7221,11 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // shortcut: a register the compiler reuses, a lane mask
-                    // on this edge and data on another (see
-                    // `structure::Lanes::join`): lanes coming this way are
-                    // taken not to read the join as data.
+                    // A register the compiler reuses, a lane mask on this
+                    // edge and data on another, where no lane coming this
+                    // way reads the join (`Structured::dead_mask_edges`).
                     (Some(Val::Missing(_)), false)
-                        if self.holds_mask(arg) && !self.holds_mask(phi.value) =>
+                        if self.x.st.dead_mask_edges.contains(&(phi.value, n)) =>
                     {
                         self.s.m.i32(0)
                     }

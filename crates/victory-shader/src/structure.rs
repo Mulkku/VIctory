@@ -8,7 +8,9 @@
 //! code only skips work that lanes outside the mask would not change, or
 //! tests a value that is the same in every lane, so either way each lane
 //! can decide alone. A register holding a mask on one path and a loaded
-//! value on another is data where the paths join. A path-sensitive
+//! value on another is data where the paths join; the mask needs no value
+//! as data only where no lane bringing it can reach a read of the join
+//! ([`Structured::dead_mask_edges`]). A path-sensitive
 //! pass then proves, for each vector instruction, that EXEC holds in every
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
@@ -316,6 +318,13 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// A register the compiler reuses: joins of data (not masks) with a
+    /// lane mask coming in on some edges, by the join's value and the
+    /// edge's predecessor index, where no lane coming in on that edge
+    /// reaches a read of the join (so the mask needs no value as data).
+    pub dead_mask_edges: HashSet<(Value, usize)>,
+    /// Such edges where a lane coming in may read the join.
+    pub live_mask_edges: usize,
 }
 
 /// Builds the per-lane form of `program`.
@@ -584,6 +593,10 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        let (dead_mask_edges, live_mask_edges) = self.reused_mask_edges(cond);
+        if self.b.overflow {
+            return Err(TOO_LARGE);
+        }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -596,7 +609,98 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            dead_mask_edges,
+            live_mask_edges,
         })
+    }
+
+    /// See [`Structured::dead_mask_edges`]: a join of data with a mask on
+    /// an edge, proven dead on that edge when the lanes taking the edge
+    /// reach no block that reads the join (an instruction there, or a phi
+    /// through the block ending at it).
+    fn reused_mask_edges(&mut self, cond: &[Bool]) -> (HashSet<(Value, usize)>, usize) {
+        let p = self.p;
+        let dwords: HashSet<Value> = self.masks.keys().flat_map(|&(lo, hi)| [lo, hi]).collect();
+        let mut readers: Map<Value, Vec<usize>> = Map::default();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                for (&a, &q) in phi.args.iter().zip(&block.preds) {
+                    readers.entry(a).or_default().push(q);
+                }
+            }
+            for inst in &block.insts {
+                for &(_, r) in &inst.reads {
+                    readers.entry(r).or_default().push(b);
+                }
+            }
+        }
+        let (mut dead, mut live) = (HashSet::new(), 0);
+        for (j, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                let data = matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1);
+                if !data || dwords.contains(&phi.value) {
+                    continue;
+                }
+                for (n, a) in phi.args.iter().enumerate() {
+                    if !dwords.contains(a) {
+                        continue;
+                    }
+                    let reach = self.reach_from_edge(cond, j, n);
+                    // Too large to follow: unproven, the program goes on.
+                    self.b.overflow = false;
+                    let read = readers.get(&phi.value).is_some_and(|rs| {
+                        rs.iter()
+                            .any(|&b| reach.as_ref().is_none_or(|r| r[b] != Bool::FALSE))
+                    });
+                    if read {
+                        live += 1;
+                    } else {
+                        dead.insert((phi.value, n));
+                    }
+                }
+            }
+        }
+        (dead, live)
+    }
+
+    /// What a lane knows in each block it can reach after entering block
+    /// `j` over its `n`th incoming edge (`FALSE`: it cannot reach it), given
+    /// `cond` (see [`Self::paths`]), to a fixpoint as there; `None` if that
+    /// does not settle.
+    fn reach_from_edge(&mut self, cond: &[Bool], j: usize, n: usize) -> Option<Vec<Bool>> {
+        let (q, taken) = self.incoming[j][n];
+        let mut reach = vec![Bool::FALSE; self.p.blocks.len()];
+        reach[j] = self.edge(cond[q], q, taken);
+        let seed = reach[j];
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for i in 0..self.order.len() {
+                let s = self.order[i];
+                let mut c = if s == j { seed } else { Bool::FALSE };
+                for k in 0..self.incoming[s].len() {
+                    let (from, t) = self.incoming[s][k];
+                    if reach[from] == Bool::FALSE {
+                        continue;
+                    }
+                    let mut e = self.edge(reach[from], from, t);
+                    if i <= self.index[from] {
+                        e = self.b.forget(e, i, &mut Map::default());
+                    }
+                    c = self.b.or(c, e);
+                }
+                if c != reach[s] {
+                    reach[s] = c;
+                    changed = true;
+                }
+            }
+            if self.b.overflow {
+                return None;
+            }
+            if !changed {
+                return Some(reach);
+            }
+        }
+        None
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
@@ -1294,5 +1398,43 @@ mod tests {
             panic!("{:?}", s.exits)
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
+        // Lanes holding the mask read the join right there.
+        assert!(s.dead_mask_edges.is_empty());
+        assert_eq!(s.live_mask_edges, 1);
+    }
+
+    #[test]
+    fn a_reused_mask_no_lane_reads_is_proven_dead() {
+        let p = build(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0003, // s_cbranch_scc1 -> 20
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBF82_0002, // s_branch -> 28
+                0xF420_0082,
+                0xFA00_0000, // 20: s_buffer_load_dword s2, s[4:7], null
+                0xBF84_0002, // 28: s_cbranch_scc0 -> 40, the same SCC
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                S_ENDPGM,
+                S_ENDPGM, // 40
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p.blocks.iter().position(|b| b.offset == 28).unwrap();
+        let phi = p.blocks[join]
+            .phis
+            .iter()
+            .find(|f| f.reg == Reg::S(2))
+            .unwrap();
+        let n = p.blocks[join]
+            .preds
+            .iter()
+            .position(|&q| p.blocks[q].offset == 8)
+            .unwrap();
+        // Lanes from the mask's side left on SCC clear, so they skip the read.
+        assert_eq!(s.dead_mask_edges, HashSet::from([(phi.value, n)]));
+        assert_eq!(s.live_mask_edges, 0);
     }
 }
