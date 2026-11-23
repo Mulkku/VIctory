@@ -140,6 +140,10 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// A descriptor handle made: by DXIL block, descriptor (load site, first
+/// dword), sampler or not, and its resource properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -174,7 +178,7 @@ struct Lower<'a> {
     /// Barycentric input VGPRs read as data, loaded (as `SV_Barycentrics`)
     /// on first use: interpolation alone needs no such input.
     barycentrics: HashMap<Value, Input>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3830,7 +3834,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4806,11 +4810,7 @@ impl<'a> Lower<'a> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
-            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
-            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
-            let k32 = l.s.m.int_const(i64t, 32);
-            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
-            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+            Ok(l.pair64(lo, hi))
         };
         match op {
             Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
@@ -4827,6 +4827,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// The i64 of low and high dwords.
+    fn pair64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -6272,8 +6283,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // DXIL's atomic operations on an integer texture UAV; the old
+            // value returns with glc. Sub is the add of the negation.
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -6293,12 +6304,16 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two per
+            // value are a 64-bit atomic: SM 6.6's 64-bit typed atomics on an
+            // R32G32 integer view (DXC annotates those 32-bit too).
+            let cmpswap = code == u32::MAX;
+            let n: u8 = match (*dmask, cmpswap) {
+                (1, false) | (3, true) => 1,
+                (3, false) | (0xF, true) => 2,
+                _ => return Err("an image atomic of other channels"),
+            };
+            let wide = n == 2;
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6307,42 +6322,75 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let vals = self.vgprs(inst, data, if cmpswap { 2 * n } else { n })?;
+            let (ty, suffix) = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
+                (self.s.m.int(64), "i64")
+            } else {
+                (self.s.t.i32, "i32")
             };
+            // Value k of the data (cmpswap: 0 the new value, 1 the compare).
+            let value = |l: &mut Self, k: usize| {
+                if wide {
+                    l.pair64(vals[2 * k], vals[2 * k + 1])
+                } else {
+                    vals[k]
+                }
+            };
+            let mut olds = Vec::new();
+            for k in 0..n {
+                olds.push(match inst.read(Reg::V(reg + k)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                });
+            }
             let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
-            let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let (at, r) = if cmpswap {
+                let (new, compare) = (value(self, 0), value(self, 1));
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
+                args.extend([compare, new]);
+                let at = self.begin_guarded(guard);
+                let r = self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{suffix}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
-                )
+                );
+                (at, r)
             } else {
+                let mut x = value(self, 0);
+                if op == "sub" {
+                    let z = self.s.m.int_const(ty, 0);
+                    x = self.s.m.bin(c, Bin::Sub, z, x);
+                }
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
-                args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                args.push(x);
+                let at = self.begin_guarded(guard);
+                let r = self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{suffix}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                );
+                (at, r)
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let parts = if wide {
+                let (lo, hi) = self.split64(r);
+                vec![(lo, olds[0]), (hi, olds[1])]
+            } else {
+                vec![(r, olds[0])]
+            };
+            let r = self.end_guarded(at, &parts);
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                for (k, x) in r.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, None);
+                }
             }
             return Ok(());
         }

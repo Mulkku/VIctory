@@ -66,8 +66,16 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. Global loads
+//!   from a root SRV read it raw.
+//! * **64-bit texture atomics** (added 2026-11-24; visibility-buffer and
+//!   depth min/max writes, two dwords per value): SM 6.6 64-bit typed
+//!   atomics on a heap resource. The host's view at that index must be an
+//!   R32G32 integer view (`R32G32_UINT` or `_SINT`), and the
+//!   device must report `AtomicInt64OnTypedResourceSupported` (options 9)
+//!   and `AtomicInt64OnDescriptorHeapResourceSupported` (options 11); a
+//!   device without them refuses the pipeline. No 32-bit emulation exists:
+//!   a 64-bit max or compare-exchange cannot be built from 32-bit ones.
 //! * **Barycentrics read as data** (added 2026-11-24): the console's i and
 //!   j of a pixel are the weights of vertices 1 and 2; read other than by
 //!   interpolation, they become `SV_Barycentrics` channels y and z (one

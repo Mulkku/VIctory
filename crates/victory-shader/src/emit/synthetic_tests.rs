@@ -5,15 +5,50 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::bitcode::{Attr, Term};
 use super::container::{self, SigElement};
-use super::host::{Draw, Host};
+use super::host::{Dispatch, Draw, Host, Root, View};
 use super::shader::Shader;
 use super::validator::Validator;
 use super::{HostShader, emit};
 use crate::dxbc::Container;
-use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
+    UsedResource,
+};
 use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+/// The descriptor at the start of the table whose address is user-data
+/// dword 0, in s[4:11].
+const LOAD_UAV: [u32; 5] = [
+    0xBE82_0300, // s_mov_b32 s2, s0
+    0xBE83_0380, // s_mov_b32 s3, 0
+    0xF40C_0101,
+    0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// One UAV table in user-data dword 0.
+fn uav_table() -> (Vec<RootParam>, Vec<UsedResource>) {
+    let layout = vec![RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let used = vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 1,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    }];
+    (layout, used)
+}
 
 fn element(name: &str, kind: u8, row: u32) -> SigElement {
     SigElement {
@@ -111,6 +146,162 @@ fn position_vs() -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
     }
+}
+
+fn typed_atomics_64(host: &Host) -> bool {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut h = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    // SAFETY: feature queries with matching structures.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+            .is_ok()
+            && host
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS11,
+                    (&raw mut h).cast(),
+                    size_of_val(&h) as u32,
+                )
+                .is_ok()
+            && o.AtomicInt64OnTypedResourceSupported.as_bool()
+            && h.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
+#[test]
+fn image_atomics_of_64_bits_run_on_the_host() {
+    // 8 threads (x in v0) on an 8x4 R32G32 texture:
+    // row 0: umax of (64 - x, x) at (x & 3, 0): the high dword decides;
+    // row 1: add of 0xFFFFFFFF twice per texel at (x & 3, 1): a carry;
+    // row 2: cmpswap 0 -> (x + 1, 7), then (x + 1, 7) -> (5, 6) with glc;
+    // row 3: or of what that second cmpswap returned, at (x, 3).
+    let mut words = LOAD_UAV.to_vec();
+    words.extend([
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x4C06_00C0, // v_sub_nc_u32 v3, 64, v0
+        0x7E08_0300, // v_mov_b32 v4, v0
+        0xF05C_1308,
+        0x0001_0301, // image_atomic_umax v[3:4], v[1:2], s[4:11] dmask:0x3 dim:2D unorm
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7E06_02C1, // v_mov_b32 v3, -1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xF044_1308,
+        0x0001_0301, // image_atomic_add v[3:4], v[1:2], s[4:11] dmask:0x3 dim:2D unorm
+        0x7E0E_0300, // v_mov_b32 v7, v0
+        0x7E10_0282, // v_mov_b32 v8, 2
+        0x4A06_0081, // v_add_nc_u32 v3, 1, v0
+        0x7E08_0287, // v_mov_b32 v4, 7
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xF040_1F08,
+        0x0001_0307, // image_atomic_cmpswap v[3:6], v[7:8], s[4:11] dmask:0xf dim:2D unorm
+        0x7E12_0285, // v_mov_b32 v9, 5
+        0x7E14_0286, // v_mov_b32 v10, 6
+        0x4A16_0081, // v_add_nc_u32 v11, 1, v0
+        0x7E18_0287, // v_mov_b32 v12, 7
+        0xF040_3F08,
+        0x0001_0907, // image_atomic_cmpswap v[9:12], v[7:8], s[4:11] dmask:0xf dim:2D unorm glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E10_0283, // v_mov_b32 v8, 3
+        0xF064_1308,
+        0x0001_0907, // image_atomic_or v[9:10], v[7:8], s[4:11] dmask:0x3 dim:2D unorm
+        S_ENDPGM,
+    ]);
+    let (layout, used) = uav_table();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout,
+        used,
+        // One user SGPR, thread id x in v0.
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2,
+            threads: [8, 1, 1],
+        }),
+        code: vec![],
+    };
+    let cs = translate(&words, native, &[], &[]).unwrap();
+    validate(&cs);
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    if !typed_atomics_64(&host) {
+        eprintln!("no 64-bit typed atomics on heap resources; skipped");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    // The table starts at heap index 0.
+    let user = vec![0; cs.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(user))],
+                views: &[View::Uint2TextureUav(8, 4)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    let texel = |x: u32, y: u32| {
+        let at = 2 * (y * 8 + x) as usize;
+        (out[0][at], out[0][at + 1])
+    };
+    for x in 0..8 {
+        let k = x & 3;
+        let (umax, add) = if x < 4 {
+            ((64 - (k + 4), k + 4), (0xFFFF_FFFE, 1))
+        } else {
+            ((0, 0), (0, 0))
+        };
+        assert_eq!(texel(x, 0), umax, "umax at {x}");
+        assert_eq!(texel(x, 1), add, "add at {x}");
+        assert_eq!(texel(x, 2), (5, 6), "cmpswap at {x}");
+        assert_eq!(texel(x, 3), (x + 1, 7), "cmpswap's old value at {x}");
+    }
+}
+
+#[test]
+fn pixel_image_atomics_of_64_bits_make_a_pipeline() {
+    // Persp center i/j (v0, v1) and the position (v2, v3, ADDR 0x302): a
+    // visibility-buffer write, umax of (i, j) at the pixel, color (i, j).
+    let mut words = LOAD_UAV.to_vec();
+    words.extend([
+        0x7E08_0F02, // v_cvt_u32_f32 v4, v2
+        0x7E0A_0F03, // v_cvt_u32_f32 v5, v3
+        0x7E0C_0300, // v_mov_b32 v6, v0
+        0x7E0E_0301, // v_mov_b32 v7, v1
+        0xF05C_1308,
+        0x0001_0604, // image_atomic_umax v[6:7], v[4:5], s[4:11] dmask:0x3 dim:2D unorm
+        0xF800_180F,
+        0x0100_0100, // exp mrt0 v0, v1, v0, v1 done vm
+        S_ENDPGM,
+    ]);
+    let target = element("SV_Target", 16, 0);
+    let position = element("SV_Position", 3, 0);
+    let mut native = pixel(0x302, vec![]);
+    (native.layout, native.used) = uav_table();
+    let ps = translate(&words, native, &[position], &[target]).unwrap();
+    validate(&ps);
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    if !typed_atomics_64(&host) {
+        eprintln!("no 64-bit typed atomics on heap resources; skipped");
+        return;
+    }
+    host.pipeline(&super::host::stub_vs(&ps).unwrap(), &ps)
+        .unwrap();
 }
 
 #[test]
