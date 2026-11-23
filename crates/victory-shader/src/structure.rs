@@ -3,10 +3,12 @@
 //!
 //! Lane masks (EXEC, compare and carry results, the SGPRs they are saved
 //! in) become per-lane booleans ([`Bools`]). A branch on a wave-wide test of
-//! a mask (`s_cbranch_execz`, `vccz`, SCC of a mask operation) becomes a
-//! branch on the lane's own bit: compiled code only skips work that lanes
-//! outside the mask would not change, or tests a value that is the same in
-//! every lane, so either way each lane can decide alone. A path-sensitive
+//! a mask (`s_cbranch_execz`, `vccz`, SCC of a mask operation or of
+//! `s_bcnt1` of a mask) becomes a branch on the lane's own bit: compiled
+//! code only skips work that lanes outside the mask would not change, or
+//! tests a value that is the same in every lane, so either way each lane
+//! can decide alone. A register holding a mask on one path and a loaded
+//! value on another is data where the paths join. A path-sensitive
 //! pass then proves, for each vector instruction, that EXEC holds in every
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
@@ -364,6 +366,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Masks reaching a join ([`Atom::Phi`]) over back edges, still to find.
+    back_edge_masks: Vec<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -427,6 +431,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            back_edge_masks: Vec::new(),
         })
     }
 
@@ -439,6 +444,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.back_edge_masks.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -492,6 +498,9 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
             }
+        }
+        while let Some(k) = self.back_edge_masks.pop() {
+            self.mask(k);
         }
         execs
     }
@@ -679,6 +688,17 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
+        // A register the compiler reuses: a mask on one path, a value loaded
+        // from memory on another. No program here loads lane masks, so the
+        // join is data, read only by lanes that come by the load.
+        let loaded = |v: Value| {
+            self.defs
+                .get(&v)
+                .is_some_and(|&(b, i)| matches!(p.blocks[b].insts[i].fields, Fields::Smem { .. }))
+        };
+        if args.iter().any(|a| loaded(a.0) || loaded(a.1)) {
+            return None;
+        }
         let mut derived = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
@@ -714,6 +734,13 @@ impl<'a> Lanes<'a> {
                     let m = if value { Bool::TRUE } else { Bool::FALSE };
                     return Some((m, derived));
                 }
+            }
+        }
+        // Lowering builds the join from every incoming mask, the ones over
+        // back edges too: those are known once the loop has been seen.
+        for (n, &a) in args.iter().enumerate() {
+            if self.index[self.incoming[block][n].0] >= self.index[block] {
+                self.back_edge_masks.push(a);
             }
         }
         let born = self.index[block];
@@ -910,6 +937,15 @@ impl<'a> Lanes<'a> {
                     } else {
                         ne
                     };
+                    self.scc_lane.insert(scc, m);
+                }
+                // `s_bcnt1` of a mask: SCC is "some lane is set", as for a
+                // mask operation.
+                if takes_mask
+                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
+                    && let (Some(scc), [a]) = (inst.write(Reg::Scc), &src[..])
+                    && let Some((m, _)) = self.operand(inst, a)
+                {
                     self.scc_lane.insert(scc, m);
                 }
             }
@@ -1179,5 +1215,84 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn a_spilled_mask_selects_per_lane() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xD761_0001,
+                0x0001_006A, // v_writelane_b32 v1, vcc_lo, 0
+                0xD761_0001,
+                0x0001_026B, // v_writelane_b32 v1, vcc_hi, 1
+                0xBEEA_0480, // s_mov_b64 vcc, 0
+                0xD760_0002,
+                0x0001_0101, // v_readlane_b32 s2, v1, 0
+                0xD760_0003,
+                0x0001_0301, // v_readlane_b32 s3, v1, 1
+                0xD501_0002,
+                0x0009_0280, // v_cndmask_b32 v2, 0, 1, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let select = &p.blocks[0].insts[6];
+        let m = s.masks[&select.read(Reg::S(2)).unwrap()];
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(s.bools.support(m), [Atom::Lane(cmp)]);
+    }
+
+    #[test]
+    fn a_count_of_a_mask_branches_per_lane() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_106A, // s_bcnt1_i32_b64 s0, vcc
+                0xBF84_0001, // s_cbranch_scc0 -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 16
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        assert!(matches!(s.bools.support(when)[..], [Atom::Lane(_)]));
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn a_register_holding_a_mask_or_a_load_is_data() {
+        let p = build(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0003, // s_cbranch_scc1 -> 20
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBF82_0002, // s_branch -> 28
+                0xF420_0082,
+                0xFA00_0000, // 20: s_buffer_load_dword s2, s[4:7], null
+                0xBF06_8002, // 28: s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> 40
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 40
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p.blocks.iter().position(|b| b.offset == 28).unwrap();
+        let phi = p.blocks[join]
+            .phis
+            .iter()
+            .find(|f| f.reg == Reg::S(2))
+            .unwrap();
+        assert!(!s.masks.contains_key(&phi.value));
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits)
+        };
+        assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
     }
 }

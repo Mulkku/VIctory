@@ -2,7 +2,12 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it: an RX 9070 XT
+//! reports 32 to 64 lanes, WARP 4 only (`WaveLaneCountMin`/`Max`, checked
+//! 2026-11-24), so WARP refuses those pipelines. SGPR spills through VGPR
+//! lanes need no lane layout ([`crate::ir::spill_traffic`]). Pixel and
+//! vertex code keeps to wave operations whose result holds on any wave
+//! size (see `lower::MaskData`), WARP's included.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!

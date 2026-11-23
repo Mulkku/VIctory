@@ -84,7 +84,9 @@ does not map title DLLs; `victory run` without `--execute` does).
 ## Shaders
 
 `victory_shader::ir::build` turns a native program into SSA, one
-instruction per machine instruction. `victory_shader::structure` then
+instruction per machine instruction; SGPRs the compiler spills to VGPR
+lanes (`v_writelane_b32`, `v_readlane_b32`) are forwarded, so a lane mask
+keeps its meaning across a spill. `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
 a lane can reach them with its EXEC bit clear. `victory_shader::resource`
@@ -92,3 +94,9 @@ traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+Wave sizes: compute code that depends on the console's lane layout
+declares the console's wave size (SM 6.6 `WaveSize`); pixel and vertex
+code uses only wave operations whose result holds on any wave size. WARP
+runs 4-lane waves, so it cannot create pipelines for compute shaders that
+declare a wave size.

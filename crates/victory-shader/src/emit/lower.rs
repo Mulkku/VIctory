@@ -203,6 +203,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// SGPR spills through VGPR lanes, left out ([`crate::ir::spill_traffic`]).
+    spills: HashSet<(usize, usize)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -231,7 +233,9 @@ enum MaskData {
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
-    /// console's but no host wave size can be declared.
+    /// console's but no host wave size can be declared. No mask is data;
+    /// of the wave operations, only minimum, maximum, and and or reductions
+    /// (see [`Lower::shape`]).
     None,
 }
 
@@ -340,6 +344,7 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let spills = crate::ir::spill_traffic(p);
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -347,15 +352,19 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_permlane")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+            // SGPR spills through VGPR lanes do not count: they are forwarded.
+            console_lanes = p.blocks.iter().enumerate().any(|(b, block)| {
+                block.insts.iter().enumerate().any(|(i, inst)| {
+                    let n = inst.name();
+                    !spills.contains(&(b, i))
+                        && (n.starts_with("ds_swizzle")
+                            || n.contains("permute")
+                            || n.starts_with("v_permlane")
+                            || n.starts_with("v_mbcnt")
+                            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                            || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+                            || reads_mask_as_data(x.st, inst))
+                })
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -497,6 +506,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            spills,
         }
     }
 
@@ -733,7 +743,17 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
         };
-        if self.mask_data == MaskData::None {
+        // Mesh lanes are the console's only within the program's own lane
+        // arithmetic: a minimum, maximum, and or or over the host's wave
+        // still gives what the HLSL operation gives on that wave (as in
+        // pixel code; mesh programs loop over the lanes' distinct values
+        // with them), but sums and prefixes count lanes, which the console's
+        // wave layout (LDS per wave) may depend on.
+        let idempotent = matches!(
+            op,
+            Op::MinU | Op::MaxU | Op::MinI | Op::MaxI | Op::MinF | Op::MaxF | Op::And | Op::Or
+        );
+        if self.mask_data == MaskData::None && (prefix.is_some() || !idempotent) {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
@@ -2293,6 +2313,12 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if self.spills.contains(&(b, i)) {
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::Missing("a spill slot"));
+            }
+            return Ok(());
+        }
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -2355,6 +2381,11 @@ impl<'a> Lower<'a> {
 
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
+    }
+
+    /// `v` is a dword of a lane mask (low or high).
+    fn holds_mask(&self, v: Value) -> bool {
+        self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)
     }
 
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
@@ -7131,6 +7162,15 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    // shortcut: a register the compiler reuses, a lane mask
+                    // on this edge and data on another (see
+                    // `structure::Lanes::join`): lanes coming this way are
+                    // taken not to read the join as data.
+                    (Some(Val::Missing(_)), false)
+                        if self.holds_mask(arg) && !self.holds_mask(phi.value) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
