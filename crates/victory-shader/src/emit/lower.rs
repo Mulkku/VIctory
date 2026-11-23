@@ -3369,6 +3369,9 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
                 // join picks one with a phi.
+                // shortcut: a static sampler among them stops the program
+                // (DXIL takes no phi of handles; the access would have to
+                // run once per sampler kind).
                 let _ = site;
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
@@ -5978,7 +5981,19 @@ impl<'a> Lower<'a> {
                                 .int_value(lod)
                                 .is_some_and(|x| x as u32 & 0x7FFF_FFFF == 0);
                         if !level0 {
-                            return Err("a gather from a computed level");
+                            if dmask.count_ones() != 1 || *d16 {
+                                return Err("a gather from a computed level");
+                            }
+                            let lod = to_float(self, lod);
+                            let Operand::Vector { reg, .. } = *data else {
+                                return Err("an image result");
+                            };
+                            let ch = dmask.trailing_zeros();
+                            let r = self.gather_level(h, &cs, &os, lod, kind, ch)?;
+                            for (k, x) in r.into_iter().enumerate() {
+                                self.write(inst, Reg::V(reg + k as u8), x, guard);
+                            }
+                            return Ok(());
                         }
                     }
                     if dmask.count_ones() != 1 {
@@ -6061,6 +6076,90 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// `image_gather4_l` at a computed level, which DXIL's gather cannot
+    /// take: channel `ch` of the four texels a bilinear sample at the
+    /// nearest level would read, through texel loads, in gather order
+    /// (i0,j1), (i1,j1), (i1,j0), (i0,j0). The register results.
+    // shortcut: texels past the edge are clamped (the sampler's address
+    // mode is not followed).
+    fn gather_level(
+        &mut self,
+        h: V,
+        cs: &[V],
+        os: &[V],
+        lod: V,
+        kind: u32,
+        ch: u32,
+    ) -> Result<[V; 4], Why> {
+        if !matches!(kind, 2 | 7) {
+            return Err("a gather from a computed level outside 2D");
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let f32t = self.s.t.f32;
+        let iu = self.s.m.undef(i32t);
+        let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        // The nearest level within the view.
+        let zero = self.s.m.i32(0);
+        let d0 = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
+        let levels = self.s.m.extract(c, d0, 3);
+        let (fz, half) = (self.s.m.f32(0), self.s.m.f32(0.5f32.to_bits()));
+        let l = self.binary(35, lod, fz);
+        let l = self.s.m.bin(c, Bin::Add, l, half);
+        let l = self.unary(27, l);
+        let l = self.s.m.cast(c, Cast::FpToUi, l, i32t);
+        let one = self.s.m.i32(1);
+        let last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let past = self.s.m.cmp(c, pred::IUGT, l, last);
+        let level = self.s.m.select(c, past, last, l);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
+        // Per axis: the first texel (offset applied), then both clamped.
+        let mut pairs = [[zero; 2]; 2];
+        for (k, pair) in pairs.iter_mut().enumerate() {
+            let n = self.s.m.extract(c, d, k as u32);
+            let nf = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, cs[k], nf);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            let x = self.unary(27, x);
+            let mut i = self.s.m.cast(c, Cast::FpToSi, x, i32t);
+            if os[k] != iu {
+                i = self.s.m.bin(c, Bin::Add, i, os[k]);
+            }
+            let top = self.s.m.bin(c, Bin::Sub, n, one);
+            for (e, slot) in pair.iter_mut().enumerate() {
+                let at = self.s.m.i32(e as u32);
+                let t = self.s.m.bin(c, Bin::Add, i, at);
+                let low = self.s.m.cmp(c, pred::SLT, t, zero);
+                let t = self.s.m.select(c, low, zero, t);
+                let high = self.s.m.cmp(c, pred::SGT, t, top);
+                *slot = self.s.m.select(c, high, top, t);
+            }
+        }
+        let slice = if kind == 7 {
+            let s = self.unary(26, cs[2]);
+            self.s.m.cast(c, Cast::FpToUi, s, i32t)
+        } else {
+            iu
+        };
+        let [[i0, i1], [j0, j1]] = pairs;
+        Ok([(i0, j1), (i1, j1), (i1, j0), (i0, j0)].map(|(x, y)| {
+            let r = self.s.op(
+                c,
+                "textureLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                66,
+                &[h, level, x, y, slice, iu, iu, iu],
+            );
+            let v = self.s.m.extract(c, r, ch);
+            self.as_int(v)
+        }))
     }
 
     /// The direction a cube sample's face coordinates stand for: the
