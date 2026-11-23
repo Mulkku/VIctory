@@ -30,10 +30,19 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs, root SRVs and root UAVs** (raw buffers) as root
+//!   descriptors `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the
+//!   title's root parameter index ([`HostShader::root_cbvs`],
+//!   [`HostShader::root_srvs`], [`HostShader::root_uavs`]); the address
+//!   the title sets is the buffer's. What shaders write through a root UAV
+//!   goes back to title memory after the submission, as for UAVs in the
+//!   heap.
+//! * **Spilled root parameters** (added 2026-11-24): a compute root
+//!   signature larger than the 16 user-data registers passes the rest in
+//!   memory ([`crate::resource::SPILLED`]); the translation reads those
+//!   parameters as user data like the others (constants and table offsets
+//!   at their user-data index, root descriptors as the root views above),
+//!   so the host binds them the same way.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -178,6 +187,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -601,6 +613,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -866,6 +879,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         }
     }
 
@@ -966,6 +980,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -976,6 +991,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1070,5 +1086,98 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res, None);
+    }
+
+    /// A compute program whose root signature spills past the 16 user-data
+    /// registers: a root UAV and a root constant read from the spill
+    /// table, a dword loaded from the UAV, the sum stored back into it.
+    #[test]
+    #[cfg(windows)]
+    fn spilled_root_uav_is_read_and_written() {
+        use crate::native::{
+            ComputeIo, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+        };
+        let words: [u32; 18] = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0x8703_FF01,
+            0x0000_00FF, // s_and_b32 s3, s1, 0xff
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0xF400_0301,
+            0xFA00_0008, // s_load_dword s12, s[2:3], 0x8
+            0xF400_0344,
+            0xFA00_0000, // s_load_dword s13, s[8:9], null
+            0xBE8A_03C1, // s_mov_b32 s10, -1
+            0xBE8B_03FF,
+            0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+            0x3400_0082, // v_lshlrev_b32 v0, 2, v0
+            0xE070_1000,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let used = |kind, root, user_data, slot| UsedResource {
+            kind,
+            root,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Descriptor, 2, 16, 0),
+                param(RootType::Constants, 1, 18, 1),
+            ],
+            used: vec![
+                used(ResourceType::Uav, RootType::Descriptor, 16, 0),
+                used(ResourceType::Cbv, RootType::Constants, 18, 1),
+            ],
+            // Four user SGPRs, one thread id VGPR.
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 4 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let c = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let cs = super::emit(&c, &native, &p, &st, &io, &res, None).unwrap();
+        assert_eq!(cs.root_uavs, [0]);
+        assert!(cs.root_cbvs.is_empty() && cs.root_srvs.is_empty());
+        let constant: Vec<_> = cs.user_data.iter().map(|u| (u.index, u.slot)).collect();
+        assert_eq!(constant, [(18, 1)]);
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut cs.dxil.clone()).unwrap();
+        }
+        match super::host::Host::new(true) {
+            Ok(host) => {
+                host.compute_pipeline(&cs).unwrap();
+            }
+            Err(e) => eprintln!("no WARP device ({e}); pipeline not made"),
+        }
     }
 }

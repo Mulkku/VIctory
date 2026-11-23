@@ -104,3 +104,9 @@ declares the console's wave size (SM 6.6 `WaveSize`); pixel and vertex
 code uses only wave operations whose result holds on any wave size. WARP
 runs 4-lane waves, so it cannot create pipelines for compute shaders that
 declare a wave size.
+
+A compute root signature larger than the 16 user-data registers passes
+the rest in a table in memory; the tracer reads loads from that table as
+the root parameters themselves, so they bind like the others (root UAVs
+included). SGPRs spilled to VGPR lanes and read back are the spilled
+value.

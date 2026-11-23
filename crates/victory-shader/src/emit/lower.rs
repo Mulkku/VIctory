@@ -22,6 +22,13 @@ use crate::structure::{Atom, Bool, LaneExit, Structured, WaveJoin};
 
 type Why = &'static str;
 
+/// Why dwords a scalar load reads from a table or heap have no DXIL value:
+/// they are a descriptor (see [`Lower::descriptor_data`]).
+const SCALAR_DATA: Why = "a scalar memory read as data";
+const DESCRIPTOR_ONLY_DATA: Why = "a descriptor read only as data";
+const DESCRIPTOR_FIELDS: Why = "a descriptor's address or format read as data";
+const CBV_DATA: Why = "a constant buffer's descriptor read as data";
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -35,6 +42,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -154,6 +162,8 @@ struct Lower<'a> {
     side_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
+    /// `v_readlane_b32` results that read back a spilled SGPR value.
+    restored: HashMap<Value, Value>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
@@ -699,6 +709,7 @@ impl<'a> Lower<'a> {
             side_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
+            restored: x.res.restored.iter().copied().collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
@@ -1202,11 +1213,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3240,8 +3253,23 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
-            return self.code_smem(inst, a);
+        if self.x.res.spills.contains(&site) {
+            // Root parameters: user data, read where the code uses them.
+            for &(_, w) in &inst.writes {
+                if !self.params.contains_key(&w) {
+                    self.vals
+                        .insert(w, Val::Missing("a spilled user-data dword no parameter has"));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(a) = self.scalar.get(&site).copied() {
+            if a.param == CODE {
+                return self.code_smem(inst, a);
+            }
+            if self.x.native.layout[a.param].root == RootType::Descriptor {
+                return self.root_smem(inst, site, a);
+            }
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -3361,13 +3389,13 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        const OTHER: Why = DESCRIPTOR_FIELDS;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(SCALAR_DATA);
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3375,7 +3403,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(SCALAR_DATA),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -3391,7 +3419,7 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            return Err(DESCRIPTOR_ONLY_DATA);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3425,11 +3453,11 @@ impl<'a> Lower<'a> {
                     (11 | u, 0)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+                    return Err(CBV_DATA);
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(SCALAR_DATA),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3524,6 +3552,66 @@ impl<'a> Lower<'a> {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
             let x = self.code_dword(at)?;
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `s_load_dword*` of data from a root descriptor's buffer (a root
+    /// CBV, SRV or UAV, by the used-resource entry of its parameter).
+    fn root_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load from a root descriptor"),
+        };
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let kind = self.used_kind(&src).map(|u| u.kind);
+        let constant = matches!(kind, Some(ResourceType::Cbv) | None);
+        let props = match kind {
+            Some(ResourceType::Uav) => (11 | 0x1000, 0),
+            Some(ResourceType::Srv) => (11, 0),
+            _ => (13, 0x1_0000),
+        };
+        let h = self.handle(site, &src, false, props)?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, off);
+            let x = if constant {
+                self.cbuffer_dword(h, at)
+            } else {
+                let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, at, u, mask, al],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                self.as_int(x)
+            };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -3781,7 +3869,10 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), p) if p & !0x1000 == 11 => {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { .. } => {
@@ -4630,6 +4721,18 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                if let Some((&w, &spilled)) = inst
+                    .writes
+                    .first()
+                    .and_then(|w| self.restored.get_key_value(&w.1))
+                {
+                    // An SGPR spilled to a lane and read back: the value
+                    // itself (the lane may hold a descriptor, which has no
+                    // DXIL value).
+                    let val = self.get(spilled).unwrap_or_else(Val::Missing);
+                    self.vals.insert(w, val);
+                    return Ok(());
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
