@@ -6562,7 +6562,9 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // A level query takes no array slice (DXIL wants it undefined).
+            let read = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(read) {
                 let x = addr_val(self, at(first + grads + k))?;
                 *slot = to_float(self, x);
             }
