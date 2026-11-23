@@ -6210,6 +6210,23 @@ impl<'a> Lower<'a> {
         if !matches!(kind, 2 | 7) {
             return Err("a gather from a computed level outside 2D");
         }
+        let (&w0, &w3) = (
+            words.first().ok_or("a sampler")?,
+            words.get(3).ok_or("a sampler")?,
+        );
+        // GFX10 modes: wrap, mirror, clamp, mirror once, then half-border
+        // ones (not followed), clamp to border; border colours transparent
+        // black, opaque black, opaque white, or a table entry (not followed).
+        let modes = [w0 & 7, w0 >> 3 & 7];
+        if modes.iter().any(|m| matches!(m, 4 | 5 | 7)) {
+            return Err("a gather from a computed level with half-border addressing");
+        }
+        let border = match w3 >> 30 {
+            0 => 0.0f32,
+            1 => f32::from(u8::from(ch == 3)),
+            2 => 1.0,
+            _ => return Err("a gather from a computed level with a custom border colour"),
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let f32t = self.s.t.f32;
@@ -6298,18 +6315,27 @@ impl<'a> Lower<'a> {
         };
         let border = self.s.m.f32(border.to_bits());
         let [[i0, i1], [j0, j1]] = pairs;
-        Ok([(i0, j1), (i1, j1), (i1, j0), (i0, j0)].map(|(x, y)| {
-            let r = self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &[h, level, x, y, slice, iu, iu, iu],
-            );
-            let v = self.s.m.extract(c, r, ch);
-            self.as_int(v)
-        }))
+        Ok(
+            [(i0, j1), (i1, j1), (i1, j0), (i0, j0)].map(|((x, xo), (y, yo))| {
+                let r = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &[h, level, x, y, slice, iu, iu, iu],
+                );
+                let mut v = self.s.m.extract(c, r, ch);
+                let out = match (xo, yo) {
+                    (Some(a), Some(b)) => Some(self.s.m.bin(c, Bin::Or, a, b)),
+                    (a, b) => a.or(b),
+                };
+                if let Some(out) = out {
+                    v = self.s.m.select(c, out, border, v);
+                }
+                self.as_int(v)
+            }),
+        )
     }
 
     /// The direction a cube sample's face coordinates stand for: the
