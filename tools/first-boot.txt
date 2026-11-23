@@ -1,0 +1,9 @@
+# vrun input script: a fresh data folder into the world (software adapter).
+# One press per line: `key <when>:<key>` or `pad <when>:<button>`;
+# <when> is seconds or f<n> (presented frame). Each press below was checked
+# by vrun's capture comparison (summary.json `presses`, `visible`).
+# Screens wait for input, so a press only needs to come after its screen
+# appears and before the next press.
+
+# Account screen (appears near frame 250): A picks the signed-in player.
+pad f400:A
