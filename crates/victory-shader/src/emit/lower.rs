@@ -3366,33 +3366,45 @@ impl<'a> Lower<'a> {
                     _ => Err("a root UAV or typed root view"),
                 }
             }
-            Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
-                // shortcut: a static sampler among them stops the program
-                // (DXIL takes no phi of handles; the access would have to
-                // run once per sampler kind).
+            Source::Phi { .. } => {
+                // shortcut: a static sampler among the sources goes through
+                // `sampler_paths`; elsewhere it stops the program (DXIL
+                // takes no phi of handles).
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+                let index = self.phi_index(src, sampler)?;
+                Ok(self.s.heap_handle(self.cur, index, sampler, props))
             }
         }
+    }
+
+    /// The heap index of a heap descriptor chosen by control flow: each
+    /// predecessor computes its index at its end (a nested choice at its
+    /// own join), and the join picks one with a phi.
+    fn phi_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let Source::Phi { block, args } = src else {
+            return Err(WHY);
+        };
+        let mut incoming = Vec::new();
+        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            let here = std::mem::replace(&mut self.cur, at);
+            let index = match arg {
+                Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+                Source::Phi { .. } => self.phi_index(arg, sampler),
+                _ => Err(WHY),
+            };
+            self.cur = here;
+            incoming.push((index?, at));
+        }
+        let join = self.block[*block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// A sampler chosen by control flow among heap and static samplers,
