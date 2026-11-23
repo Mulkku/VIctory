@@ -3395,6 +3395,81 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A sampler chosen by control flow among heap and static samplers,
+    /// which no one handle can stand for (DXIL handles come straight from
+    /// their creation): the handle of one source, and per other source
+    /// its handle and whether the path taken chose it. `None` for any
+    /// other sampler source.
+    #[allow(clippy::type_complexity)]
+    fn sampler_paths(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+    ) -> Result<Option<(V, Vec<(V, V)>)>, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let Source::Phi { block, args } = src else {
+            return Ok(None);
+        };
+        if args.iter().all(|a| matches!(a, Source::Loaded { .. })) {
+            return Ok(None);
+        }
+        // Path 0: a heap sampler (its index a phi); n + 1: static `n`.
+        let mut statics: Vec<&Vec<u32>> = Vec::new();
+        let (mut index_in, mut path_in) = (Vec::new(), Vec::new());
+        let mut heap = false;
+        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            let (path, index) = match arg {
+                Source::Loaded { load, first } => {
+                    heap = true;
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, true);
+                    self.cur = here;
+                    (0, index?)
+                }
+                Source::Constant(words) => {
+                    let n = match statics.iter().position(|w| *w == words) {
+                        Some(n) => n,
+                        None => {
+                            statics.push(words);
+                            statics.len() - 1
+                        }
+                    };
+                    (n as u32 + 1, self.s.m.i32(0))
+                }
+                _ => return Err(WHY),
+            };
+            index_in.push((index, at));
+            path_in.push((self.s.m.i32(path), at));
+        }
+        let join = self.block[*block].ok_or(WHY)?;
+        let path = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(path, path_in);
+        let mut handles = Vec::new();
+        if heap {
+            let index = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(index, index_in);
+            handles.push((self.s.heap_handle(self.cur, index, true, props), 0));
+        }
+        for (n, words) in statics.into_iter().enumerate() {
+            let h = self.handle(site, &Source::Constant(words.clone()), true, props)?;
+            handles.push((h, n as u32 + 1));
+        }
+        let (first, _) = handles[0];
+        let mut others = Vec::new();
+        for &(h, n) in &handles[1..] {
+            let k = self.s.m.i32(n);
+            let chosen = self.s.m.cmp(self.cur, pred::EQ, path, k);
+            others.push((h, chosen));
+        }
+        Ok(Some((first, others)))
+    }
+
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
@@ -5730,7 +5805,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let r = if sample {
+        let (r, others) = if sample {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -5742,7 +5817,14 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sprops = (14 | if cmp { 0x8000 } else { 0 }, 0);
+            let (sh, alts) = match self.sampler_paths(site, ss, sprops)? {
+                Some(p) => p,
+                None => (self.handle(site, ss, true, sprops)?, Vec::new()),
+            };
+            if !alts.is_empty() && op == 81 {
+                return Err("a descriptor chosen by control flow");
+            }
             // The offset word, bias and reference come first, a dword each;
             // then the gradients (x then y), the coordinates and the LOD
             // or clamp. With a16 each of those three groups packs two
@@ -5869,7 +5951,7 @@ impl<'a> Lower<'a> {
             let after = at(first + grads + coords);
             let mut args = vec![h, sh];
             args.extend(&cs);
-            match op {
+            let r = match op {
                 60 => {
                     args.extend(&os);
                     args.push(fu);
@@ -6010,7 +6092,28 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+            };
+            // A sampler chosen by control flow: the access once more per
+            // other sampler, picked by the path taken.
+            let mut others = Vec::new();
+            for (s, cond) in alts {
+                let fname = match op {
+                    60 => "sample.f32",
+                    61 => "sampleBias.f32",
+                    62 => "sampleLevel.f32",
+                    63 => "sampleGrad.f32",
+                    64 => "sampleCmp.f32",
+                    65 => "sampleCmpLevelZero.f32",
+                    _ => "textureGather.f32",
+                };
+                let mut a = args.clone();
+                a[1] = s;
+                let x = self
+                    .s
+                    .op(c, fname, Attr::ReadOnly, self.s.t.res_ret, op, &a);
+                others.push((x, cond));
             }
+            (r, others)
         } else {
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6028,14 +6131,15 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
+            let r = self.s.op(
                 c,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 66,
                 &args,
-            )
+            );
+            (r, Vec::new())
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
@@ -6047,7 +6151,11 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let mut x = self.s.m.extract(c, r, ch);
+            for &(o, cond) in &others {
+                let y = self.s.m.extract(c, o, ch);
+                x = self.s.m.select(c, cond, y, x);
+            }
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
