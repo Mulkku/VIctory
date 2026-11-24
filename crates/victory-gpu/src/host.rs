@@ -275,6 +275,71 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// The host device is made with DRED's auto-breadcrumbs and page-fault
+    /// reporting on exactly when `VICTORY_D3D12_DRED` is set in a
+    /// diagnostics build: once removed, both outputs are there, and the
+    /// failure report carries the breadcrumbs. In a child process: a
+    /// process has one device per adapter, and removing it ends it for
+    /// every other test.
+    #[test]
+    fn device_removed_data_follows_the_switch() {
+        const CHILD: &str = "VICTORY_TEST_DRED_CHILD";
+        if let Some(dred) = std::env::var_os(CHILD) {
+            let Some(host) = host() else {
+                return; // no host GPU
+            };
+            let on = cfg!(feature = "diagnostics") && dred == "1";
+            assert_eq!(dred_on(), on);
+            let removed = host.device.cast::<ID3D12Device5>().unwrap();
+            let data = host.device.cast::<ID3D12DeviceRemovedExtendedData1>().unwrap();
+            // SAFETY: plain DXGI queries for the device's own adapter.
+            let adapter = unsafe {
+                let luid = host.device.GetAdapterLuid();
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                    .and_then(|a| a.GetDesc1())
+                    .map(|d| {
+                        String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_owned()
+                    })
+            };
+            // SAFETY: a live device, removed on purpose; plain queries.
+            let (crumbs, fault) = unsafe {
+                removed.RemoveDevice();
+                (
+                    data.GetAutoBreadcrumbsOutput1().map(|_| ()),
+                    data.GetPageFaultAllocationOutput1().map(|_| ()),
+                )
+            };
+            let report = host.removal_data(&[]);
+            println!(
+                "dred {on} on {adapter:?}: breadcrumbs {crumbs:?}, page faults {fault:?}, \
+                 report {report:?}"
+            );
+            assert_eq!(crumbs.is_ok(), on);
+            assert_eq!(fault.is_ok(), on);
+            assert_eq!(report.contains("; breadcrumbs (done/count, list)"), on);
+            return;
+        }
+        for dred in ["1", "0"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "host::tests::device_removed_data_follows_the_switch"])
+                .args(["--nocapture", "--test-threads=1"])
+                .env(CHILD, dred)
+                .env_remove("VICTORY_D3D12_WARP");
+            if dred == "1" {
+                child.env("VICTORY_D3D12_DRED", "1");
+            } else {
+                child.env_remove("VICTORY_D3D12_DRED");
+            }
+            let out = child.output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            eprintln!("{text}");
+            assert!(out.status.success(), "child with dred {dred}: {text}");
+            assert!(text.contains("1 passed"), "child with dred {dred} ran nothing: {text}");
+        }
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -534,6 +599,31 @@ impl Host {
         }
     }
 
+    /// Diagnostics: removes the device once `VICTORY_D3D12_REMOVE_AT`
+    /// frames are presented, just after the first submission from then on
+    /// whose lists noted commands (`runs`), so the failure report and what
+    /// the harness saves from it can be checked without a GPU fault.
+    #[cfg(feature = "diagnostics")]
+    fn remove_on_request(&self, runs: &[&HostList]) {
+        static AT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_D3D12_REMOVE_AT").ok()?.parse().ok()
+        });
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let noted = || {
+            runs.iter().any(|r| !r.notes.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
+        };
+        if AT.is_some_and(|n| crate::queue::presented() >= n)
+            && noted()
+            && !DONE.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!("removing the host device on request (VICTORY_D3D12_REMOVE_AT)");
+            if let Ok(d) = self.device.cast::<ID3D12Device5>() {
+                // SAFETY: a live device; removal is what is asked for.
+                unsafe { d.RemoveDevice() };
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -579,6 +669,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // With the lists submitted, so DRED has them in flight.
+                #[cfg(feature = "diagnostics")]
+                self.remove_on_request(runs);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -729,6 +822,13 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
+                    // The ops it completed last, the last completed one
+                    // last (none: it never started).
+                    let ops: Vec<i32> = history[(done as usize).saturating_sub(16)..done as usize]
+                        .iter()
+                        .map(|op| op.0)
+                        .collect();
+                    text.push_str(&format!(", ops completed before it {ops:?}"));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.

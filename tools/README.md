@@ -41,9 +41,18 @@ Each run gets `D:\victory-runs\<UTC time>-<label>\`:
   since start;
 - `data\`: the run's own `VICTORY_DATA_DIR` (saves, settings, `crashes.log`);
 - `crashes.log`: a copy of the run's crash log entries;
-- `dred.txt`: the host GPU failure report, with DRED data when the adapter
-  gives it (`VICTORY_D3D12_DRED=1` is always set: in a diagnostics build
-  that forces DRED's auto-breadcrumbs and page-fault reporting on);
+- `dred.txt`: the host GPU failure report as logged, then one part per
+  line (stopped lists with their DRED op named): DRED data when the
+  adapter gives it (`VICTORY_D3D12_DRED=1` is always set: in a diagnostics
+  build that forces DRED's auto-breadcrumbs and page-fault reporting on),
+  the page fault address and the allocations, host copies and descriptor
+  heaps around it, each stopped list's ops completed last, the commands in
+  flight with their marker texts, and the last commands of each list of
+  the failed submission;
+- `d3d12-debug.txt`: the D3D12 debug layer's messages (with
+  `--env VICTORY_D3D12_DEBUG=1`; the first line says whether it was on);
+- `perf.csv`: the runtime's 5-second frame lines: seconds, fps, ms/frame,
+  ms/frame on the GPU;
 - `frames\`: `VICTORY_CAPTURE` output: powers of two, every N-th frame, and
   around each frame-timed press;
 - `captures.json`: every capture's signature and difference to the one
@@ -104,7 +113,9 @@ count as near-identical (a loading spinner stays within that).
   leaves; `DXGI_ERROR_DEVICE_REMOVED`, `_RESET`, `DRIVER_INTERNAL_ERROR`),
   `tdr`, `os_driver_resets` (Display event 4101), `what` failed,
   `page_fault` (address and what DRED and the runtime place around it),
-  `in_flight_ops` (DRED op and the runtime's marker text of each command
+  `stopped_lists` (command and op each stopped at, its last completed op
+  and the ops before it), `in_flight_ops` (DRED op and the runtime's
+  marker text of each command
   in flight), `unstarted_list_pipelines`, and the last `slow_submissions`
   (with their pipelines) and `slow_commands` before the end;
 - `captures`: count, black ones, the last, the last not black, and

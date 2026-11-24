@@ -50,7 +50,37 @@ CRASH = re.compile(r"VIctory: unhandled exception (0x[0-9a-f]+) at (\S+)(?: \((.
 RELAUNCHED = re.compile(r"\brelaunched\b.*\bpid=(\d+)")
 # A host GPU failure report: DRED's stopped lists, and the draws and
 # dispatches in flight.
-STOPPED = re.compile(r"a list stopped at command (\d+) of (\d+) \(op (\d+)\)")
+STOPPED = re.compile(r"a list stopped at command (\d+) of (\d+) \(op (\d+)\)"
+                     r"(?:, ops completed before it \[([^\]]*)\])?")
+# D3D12_AUTO_BREADCRUMB_OP by value.
+BREADCRUMB_OPS = [
+    "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
+    "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource",
+    "CopyTiles", "ResolveSubresource", "ClearRenderTargetView", "ClearUnorderedAccessView",
+    "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+    "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUint",
+    "AtomicCopyBufferUint64", "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1",
+    "SetProtectedResourceSession", "DecodeFrame2", "ProcessFrames1",
+    "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+    "CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand",
+    "ExecuteMetaCommand", "EstimateMotion", "ResolveMotionVectorHeap", "SetPipelineState1",
+    "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+]
+
+
+def op_name(op):
+    op = int(op)
+    return BREADCRUMB_OPS[op] if 0 <= op < len(BREADCRUMB_OPS) else f"op {op}"
+
+
+def stopped_list(m):
+    """A STOPPED match: where the list stopped, on which op, and the ops it
+    completed just before (the last completed one last)."""
+    ops = [op_name(o) for o in (m.group(4) or "").split(", ") if o]
+    return {"at_command": int(m.group(1)), "of": int(m.group(2)), "op": op_name(m.group(3)),
+            "last_completed_op": ops[-1] if ops else None, "ops_completed_before": ops}
+
+
 IN_FLIGHT = re.compile(r"list \d+ of \d+, of its \d+: (\w+)")
 # What the commands in flight run, by their markers, and what lists that
 # never started bind.
@@ -314,6 +344,7 @@ class Run:
         # list commands (t, ms, op text) before the end.
         self.slow_submissions = collections.deque(maxlen=8)
         self.slow_commands = collections.deque(maxlen=24)
+        self.debug_layer = []  # the D3D12 debug layer's messages, as logged
         self.input_t = None
         self.saved = []  # (frame, t) of captures the log reported
         self.captures = None
@@ -393,6 +424,8 @@ class Run:
                 self.input_t = t
             if " ERROR victory_gpu::host:" in record and self.gpu_failure is None:
                 self.gpu_failure = record
+            if " victory_gpu::host: D3D12: " in record:
+                self.debug_layer.append(f"[{t:8.1f}] {record}")
             for stage, pattern in self.args.stage_patterns:
                 if stage not in self.log_stage_at and pattern.search(record):
                     self.log_stage_at[stage] = round(t, 1)
@@ -789,7 +822,8 @@ def device_loss(run, failure, reason, code):
         "os_driver_resets": resets,
         "what": what or None,
         "page_fault": fault,
-        "in_flight_ops": [{"op": int(m.group(1)), "marker": m.group(2).strip()}
+        "stopped_lists": [stopped_list(m) for m in STOPPED.finditer(failure)],
+        "in_flight_ops": [{"op": op_name(m.group(1)), "marker": m.group(2).strip()}
                           for m in IN_FLIGHT_OP.finditer(failure)],
         "unstarted_list_pipelines": [m.group(1) for m in LIST_PIPELINES.finditer(failure)],
         "slow_submissions": [{"at_s": t, "ms": ms, "lists": n, "pipelines": p}
@@ -842,8 +876,21 @@ def finish(run, meta, end, code, stopped):
         with open(os.path.join(d, "crashes.log"), "w", encoding="utf-8") as f:
             f.write(crash_text)
     if run.gpu_failure:
+        # The record as logged, then one part per line.
         with open(os.path.join(d, "dred.txt"), "w", encoding="utf-8") as f:
-            f.write(run.gpu_failure + "\n")
+            f.write(run.gpu_failure + "\n\n")
+            for part in run.gpu_failure.split("; "):
+                part = STOPPED.sub(lambda m: m.group(0) + " = " + op_name(m.group(3)), part)
+                f.write(part.strip() + "\n")
+    with open(os.path.join(d, "d3d12-debug.txt"), "w", encoding="utf-8") as f:
+        on = "VICTORY_D3D12_DEBUG" in meta["env"]  # set at all: on (as the runtime reads it)
+        f.write(f"# D3D12 debug layer {'on' if on else 'off (--env VICTORY_D3D12_DEBUG=1)'}: "
+                f"{len(run.debug_layer)} messages\n")
+        f.writelines(line + "\n" for line in run.debug_layer)
+    with open(os.path.join(d, "perf.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["seconds", "fps", "ms_per_frame", "gpu_ms_per_frame"])
+        w.writerows(run.perf)
     if run.crash is None and (m := CRASH.search(crash_text)):
         run.crash = {"exception": m.group(1), "at": m.group(2), "detail": m.group(3) or ""}
 
