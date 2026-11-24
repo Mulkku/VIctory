@@ -169,6 +169,8 @@ pub(crate) struct BlockShape {
     pub constant_branch: bool,
     /// Per phi, its incoming values: a constant's integer, else `None`.
     pub phis: Vec<Vec<Option<i64>>>,
+    /// The functions the block calls, by name, in order.
+    pub calls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -557,6 +559,14 @@ impl Module {
                         .map(|&i| match &self.insts[i as usize].op {
                             Op::Phi(incoming) => incoming.iter().map(|&(v, _)| int(v)).collect(),
                             _ => unreachable!("a phi"),
+                        })
+                        .collect(),
+                    calls: blk
+                        .body
+                        .iter()
+                        .filter_map(|&i| match &self.insts[i as usize].op {
+                            Op::Call(f, _) => Some(self.funcs[*f as usize].name.clone()),
+                            _ => None,
                         })
                         .collect(),
                 }
