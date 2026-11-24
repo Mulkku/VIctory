@@ -1,9 +1,26 @@
 # vrun input script: a fresh data folder into the world (software adapter).
 # One press per line: `key <when>:<key>` or `pad <when>:<button>`;
-# <when> is seconds or f<n> (presented frame). Each press below was checked
-# by vrun's capture comparison (summary.json `presses`, `visible`).
+# <when> is seconds or f<n> (presented frame); `f<a>..f<b>/<n>:<names>`
+# presses the names in turn every n frames from a to b. vrun checks every
+# press against the captures (summary.json `presses`, `visible`).
 # Screens wait for input, so a press only needs to come after its screen
-# appears and before the next press.
+# appears and before the next press. Frames are from WARP runs on fresh data.
 
-# Account screen (appears near frame 250): A picks the signed-in player.
+# Account screen (appears near frame 150-250): A picks the signed-in player.
 pad f400:A
+# Intro video, logo, then four setup pages (navigation, subtitles, ...) from
+# about frame 900: A continues each; Down is harmless there.
+pad f900..f1380/60:A Down
+# Legal notices (about frame 1400): "Next" is two entries down.
+pad f1440:Down
+pad f1560:Down
+pad f1620:A
+# Legal terms (about frame 1640): tick Privacy, Down, tick Terms, Down,
+# Confirm. A ticked box changes too few pixels to count as visible.
+pad f1700:A
+pad f1760:Down
+pad f1820:A
+pad f1880:Down
+pad f1940:A
+# Whatever asks next (a menu's first entry); harmless while loading.
+pad f2100..f3000/150:A
