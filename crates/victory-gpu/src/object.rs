@@ -357,9 +357,8 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table
 }
 
-#[cfg(test)]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
-    // SAFETY: `object` is ours and its table has the slot.
+    // SAFETY: `object` is a COM object (ours or the host's) whose table has the slot.
     let f = unsafe { *(*object).functions.add(offset / 8) };
     // SAFETY: the caller names the slot's signature.
     unsafe { std::mem::transmute_copy(&f) }
