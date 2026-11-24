@@ -59,6 +59,15 @@ impl Pending {
         }
     }
 
+    /// Tests: a pending pipeline made already as `host`.
+    #[cfg(test)]
+    pub(crate) fn made(host: HostPipeline) -> Pending {
+        let p = Pending::new(Vec::new(), None);
+        p.queued.store(true, Ordering::Relaxed);
+        let _ = p.made.set(Some(host));
+        p
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
