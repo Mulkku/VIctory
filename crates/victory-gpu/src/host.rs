@@ -134,7 +134,16 @@ fn create() -> windows::core::Result<Host> {
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.into_iter().for_each(|l| l.EnableDebugLayer()),
+                Ok(()) => layer.into_iter().for_each(|l| {
+                    l.EnableDebugLayer();
+                    // GPU-based validation (`VICTORY_D3D12_GBV`): descriptors
+                    // and states checked as shaders use them (slow).
+                    if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+                        && let Ok(l1) = l.cast::<ID3D12Debug1>()
+                    {
+                        l1.SetEnableGPUBasedValidation(true);
+                    }
+                }),
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
         }
