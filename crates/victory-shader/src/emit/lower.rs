@@ -47,6 +47,9 @@ pub(crate) struct Lowered {
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     pub views: Vec<DeclaredView>,
+    /// The function's blocks as written.
+    #[cfg(test)]
+    pub shape: Vec<super::bitcode::BlockShape>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -506,22 +509,7 @@ fn lane_reaches(
         if to(b) {
             return true;
         }
-        match st.exits[b] {
-            LaneExit::Jump(t) => stack.push(t),
-            LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } => {
-                if when != Bool::FALSE {
-                    stack.push(taken);
-                }
-                if when != Bool::TRUE {
-                    stack.push(not_taken);
-                }
-            }
-            LaneExit::End | LaneExit::Indirect => {}
-        }
+        stack.extend(st.exits[b].lane_targets());
     }
     false
 }
@@ -1142,7 +1130,20 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        let order = crate::ir::reverse_postorder(&p.blocks);
+        // Only the blocks a lane can reach: a branch `structure` decided
+        // goes one way ([`LaneExit::decided`]), so what lies only behind its
+        // other side is left out.
+        let mut reached = vec![false; p.blocks.len()];
+        let mut stack = vec![0];
+        while let Some(b) = stack.pop() {
+            if !std::mem::replace(&mut reached[b], true) {
+                stack.extend(self.x.st.exits[b].lane_targets());
+            }
+        }
+        let order: Vec<usize> = crate::ir::reverse_postorder(&p.blocks)
+            .into_iter()
+            .filter(|&b| reached[b])
+            .collect();
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
@@ -1155,10 +1156,9 @@ impl<'a> Lower<'a> {
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
-            let header = p.blocks[b]
-                .preds
-                .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
+            let preds = &p.blocks[b].preds;
+            let header =
+                (0..preds.len()).any(|n| self.live_pred(b, n) && self.rpo[b] <= self.rpo[preds[n]]);
             if header {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
@@ -1175,11 +1175,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
-            let preds: Vec<usize> = p.blocks[b]
-                .preds
-                .iter()
-                .copied()
-                .filter(|&q| self.block[q].is_some())
+            let preds: Vec<usize> = (0..p.blocks[b].preds.len())
+                .filter(|&n| self.live_pred(b, n))
+                .map(|n| p.blocks[b].preds[n])
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
@@ -1228,6 +1226,8 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            shape: self.s.m.shape(),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -3934,8 +3934,9 @@ impl<'a> Lower<'a> {
             return Err(WHY);
         };
         let mut incoming = Vec::new();
-        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-            if self.block[q].is_none() {
+        let preds = &self.x.p.blocks[*block].preds;
+        for (n, (&q, arg)) in preds.iter().zip(args).enumerate() {
+            if !self.live_pred(*block, n) {
                 continue;
             }
             let tail = self.tail[q].ok_or(WHY)?;
@@ -3983,8 +3984,9 @@ impl<'a> Lower<'a> {
         let mut statics: Vec<&Vec<u32>> = Vec::new();
         let (mut index_in, mut path_in) = (Vec::new(), Vec::new());
         let mut heap = false;
-        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-            if self.block[q].is_none() {
+        let preds = &self.x.p.blocks[*block].preds;
+        for (n, (&q, arg)) in preds.iter().zip(args).enumerate() {
+            if !self.live_pred(*block, n) {
                 continue;
             }
             let tail = self.tail[q].ok_or(WHY)?;
@@ -7798,7 +7800,8 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
-        let term = match self.x.st.exits[b] {
+        // A branch `structure` decided is the jump it takes.
+        let term = match self.x.st.exits[b].decided() {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
@@ -7919,10 +7922,8 @@ impl<'a> Lower<'a> {
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
         let target = self.block[to].expect("reachable");
-        let preds = self.x.p.blocks[to]
-            .preds
-            .iter()
-            .filter(|&&q| self.block[q].is_some())
+        let preds = (0..self.x.p.blocks[to].preds.len())
+            .filter(|&n| self.live_pred(to, n))
             .count();
         // Back edges stay as they are: the exiting block is the latch.
         if preds < 2 || self.rpo[to] <= self.rpo[from] {
@@ -7932,6 +7933,20 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(e, Term::Br(target));
         self.edges.insert((from, to), e);
         e
+    }
+
+    /// Whether a lane can come into IR block `b` over its `n`th
+    /// predecessor edge: the predecessor is lowered and goes to `b` the way
+    /// [`LaneExit::lane_targets`] says (a branch to `b` on both sides has
+    /// two edges unless it is decided).
+    fn live_pred(&self, b: usize, n: usize) -> bool {
+        let preds = &self.x.p.blocks[b].preds;
+        let q = preds[n];
+        let edges = self.x.st.exits[q]
+            .lane_targets()
+            .filter(|&t| t == b)
+            .count();
+        self.block[q].is_some() && preds[..n].iter().filter(|&&p| p == q).count() < edges
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
@@ -7946,6 +7961,9 @@ impl<'a> Lower<'a> {
             let any_lane = matches!(wave, Some(WaveJoin::AnyLane(_)));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if !self.live_pred(b, n) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -7995,6 +8013,9 @@ impl<'a> Lower<'a> {
         for (v, b, side) in std::mem::take(&mut self.side_phis) {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if !self.live_pred(b, n) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 incoming.push((self.s.m.bool(n == side), qb));
@@ -8009,6 +8030,9 @@ impl<'a> Lower<'a> {
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if !self.live_pred(b, n) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let m =
@@ -8026,6 +8050,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bitcode::BlockShape;
     use super::{Numeric, Parts, SigElement, buffer_format, half_inputs, lower, packed_half};
     use crate::native::{ComputeIo, HwStage, NativeProgram, PsInput, StageIo, Usage};
     use crate::{io, ir, resource, structure};
@@ -8339,5 +8364,309 @@ mod tests {
         words.extend(store(2));
         words.push(S_ENDPGM);
         translate_compute(&words).unwrap();
+    }
+
+    /// Lowers a program as [`translate_compute`] does: how `structure` left
+    /// its branches, and the DXIL blocks.
+    fn lower_compute(words: &[u32]) -> (structure::Structured, Vec<BlockShape>) {
+        let io = StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        });
+        lower_shape(HwStage::Cs, io, vec![], words)
+    }
+
+    /// Lowers a pixel program that writes `SV_Target` from `exp mrt0` (the
+    /// perspective-center i and j arrive in v0 and v1).
+    fn lower_pixel(words: &[u32]) -> (structure::Structured, Vec<BlockShape>) {
+        let io = StageIo::Ps {
+            inputs: vec![],
+            input_addr: 2,
+            db_shader_control: 0,
+            patches: vec![],
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+            console_read: true,
+        };
+        lower_shape(HwStage::Ps, io, vec![target], words)
+    }
+
+    fn lower_shape(
+        stage: HwStage,
+        stage_io: StageIo,
+        outputs: Vec<SigElement>,
+        words: &[u32],
+    ) -> (structure::Structured, Vec<BlockShape>) {
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: stage_io,
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 16).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let shape = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 0,
+            linked: None,
+        })
+        .unwrap()
+        .shape;
+        (st, shape)
+    }
+
+    /// Branches `structure` decided.
+    fn decided(st: &structure::Structured) -> usize {
+        st.exits.iter().filter(|&&e| e.decided() != e).count()
+    }
+
+    /// Conditional branches in the DXIL, and of them those on a constant.
+    fn branches(shape: &[BlockShape]) -> (usize, usize) {
+        let cond = shape.iter().filter(|b| b.succs.len() == 2);
+        let constant = cond.clone().filter(|b| b.constant_branch).count();
+        (cond.count(), constant)
+    }
+
+    /// Branches to a block at or before the branching one.
+    fn back_edges(shape: &[BlockShape]) -> usize {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(n, b)| b.succs.iter().filter(|&&s| s <= n).count())
+            .sum()
+    }
+
+    /// v_readfirstlane_b32 s2, v0: a uniform value no constant folds.
+    const UNIFORM_S2: u32 = 0x7E04_0500;
+
+    #[test]
+    fn decided_branches_jump_and_leave_their_dead_side_out() {
+        let mut words = vec![
+            ADDRESS,
+            UNIFORM_S2,
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0005, // s_cbranch_scc1 -> 36, uniform
+            0xBE83_0387, // s_mov_b32 s3, 7
+            0xBF85_0001, // s_cbranch_scc1 -> 28: SCC is clear here, never taken
+            0xBF82_0005, // s_branch -> 48
+            0xBE83_0389, // 28: s_mov_b32 s3, 9 (no lane gets here)
+            0xBF82_0003, // s_branch -> 48
+            0xBE83_0385, // 36: s_mov_b32 s3, 5
+            0xBF85_0001, // s_cbranch_scc1 -> 48: SCC is set here, always taken
+            0xBE83_038B, // s_mov_b32 s3, 11 (no lane gets here)
+            0x7E02_0203, // 48: v_mov_b32 v1, s3
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 2, "{:?}", st.exits);
+        // The uniform branch stays; the decided ones are jumps.
+        assert_eq!(branches(&shape), (1, 0), "{shape:?}");
+        // Entry, both sides of the uniform branch, the jump after 7, the
+        // join: the blocks at 28 and 44 and the join's edge blocks are gone.
+        assert_eq!(shape.len(), 5, "{shape:?}");
+        // The join takes 7 or 5, over the two edges a lane can come by.
+        let phis: Vec<_> = shape.iter().flat_map(|b| &b.phis).collect();
+        let s3 = phis
+            .iter()
+            .find(|p| p.contains(&Some(7)))
+            .expect("a phi of s3");
+        let mut s3 = s3.to_vec();
+        s3.sort_unstable();
+        assert_eq!(s3, [Some(5), Some(7)]);
+        assert!(
+            phis.iter()
+                .all(|p| !p.contains(&Some(9)) && !p.contains(&Some(11))),
+            "{phis:?}"
+        );
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_lane_branch_keeps_both_sides() {
+        let mut words = vec![
+            ADDRESS,
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> join
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x887E_007E, // join: s_or_b32 exec_lo, exec_lo, s0
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 0, "{:?}", st.exits);
+        // The branch, the `if`, the join's edge block, the join.
+        assert_eq!(branches(&shape), (1, 0), "{shape:?}");
+        assert_eq!(shape.len(), 4, "{shape:?}");
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_uniform_loop_with_a_decided_branch_still_counts_its_iterations() {
+        let mut words = vec![
+            ADDRESS,
+            UNIFORM_S2,
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x8003_8103, // 12: s_add_u32 s3, s3, 1
+            0xBF0A_0203, // s_cmp_lt_u32 s3, s2
+            0xBF84_0003, // s_cbranch_scc0 -> 36, the uniform exit
+            0xBF84_0001, // s_cbranch_scc0 -> 32: SCC is set here, never taken
+            0xBF82_FFFB, // s_branch -> 12
+            0x7E02_0289, // 32: v_mov_b32 v1, 9 (no lane gets here)
+            0x7E02_0203, // 36: v_mov_b32 v1, s3
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 1, "{:?}", st.exits);
+        // The exit and the latch's iteration limit.
+        assert_eq!(branches(&shape), (2, 0), "{shape:?}");
+        assert_eq!(back_edges(&shape), 1, "{shape:?}");
+        // Entry, header, the decided branch's block, latch, exit, the
+        // limit's abort: the block at 32 and the exit's edge block are gone.
+        assert_eq!(shape.len(), 6, "{shape:?}");
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_back_edge_no_lane_takes_leaves_no_loop() {
+        let mut words = vec![
+            ADDRESS,
+            UNIFORM_S2,
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0003, // s_cbranch_scc1 -> 28
+            0xBE83_0385, // 16: s_mov_b32 s3, 5
+            0xBF85_FFFE, // s_cbranch_scc1 -> 16: SCC is clear here, never taken
+            0x7E02_0203, // v_mov_b32 v1, s3
+        ];
+        words.extend(store(1)); // 28
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 1, "{:?}", st.exits);
+        assert_eq!(back_edges(&shape), 0, "{shape:?}");
+        assert_eq!(branches(&shape), (1, 0), "{shape:?}");
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_decided_back_edge_stops_at_the_limit_through_the_abort_block() {
+        let mut words = vec![
+            ADDRESS,
+            UNIFORM_S2,
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0x8003_8103, // 12: s_add_u32 s3, s3, 1
+            0xBF0A_0203, // s_cmp_lt_u32 s3, s2
+            0xBF84_0002, // s_cbranch_scc0 -> 32, the uniform exit
+            0xBF85_FFFC, // s_cbranch_scc1 -> 12: SCC is set here, always taken
+            0x7E02_0289, // 28: v_mov_b32 v1, 9 (no lane gets here)
+            0x7E02_0203, // 32: v_mov_b32 v1, s3
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 1, "{:?}", st.exits);
+        assert_eq!(back_edges(&shape), 1, "{shape:?}");
+        // The latch goes on below the limit; at it, the lane leaves through
+        // the abort block, not into the block at 28.
+        let (latch, back) = shape
+            .iter()
+            .enumerate()
+            .find_map(|(n, b)| b.succs.iter().position(|&s| s <= n).map(|i| (b, i)))
+            .expect("a latch");
+        assert_eq!(latch.succs.len(), 2, "{shape:?}");
+        let stop = &shape[latch.succs[1 - back]];
+        assert!(stop.succs.is_empty() && stop.calls.is_empty(), "{shape:?}");
+        let returns = shape.iter().filter(|b| b.succs.is_empty()).count();
+        assert_eq!(returns, 2, "{shape:?}");
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_join_takes_no_value_over_an_edge_no_lane_takes() {
+        // s9 is no input of this program: the block at 36 gives the join a
+        // value with no DXIL form, over an edge no lane takes.
+        let mut words = vec![
+            ADDRESS,
+            UNIFORM_S2,
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0003, // s_cbranch_scc1 -> 28, uniform
+            0xBE83_0385, // 16: s_mov_b32 s3, 5
+            0xBF85_0003, // s_cbranch_scc1 -> 36: SCC is clear here, never taken
+            0xBF82_0003, // s_branch -> 40
+            0xBE83_0387, // 28: s_mov_b32 s3, 7
+            0xBF82_0001, // s_branch -> 40
+            0xBE83_0309, // 36: s_mov_b32 s3, s9 (no lane gets here)
+            0x7E02_0203, // 40: v_mov_b32 v1, s3
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        let (st, shape) = lower_compute(&words);
+        assert_eq!(decided(&st), 1, "{:?}", st.exits);
+        let phis: Vec<_> = shape.iter().flat_map(|b| &b.phis).collect();
+        let s3 = phis
+            .iter()
+            .find(|p| p.contains(&Some(7)))
+            .expect("a phi of s3");
+        let mut s3 = s3.to_vec();
+        s3.sort_unstable();
+        assert_eq!(s3, [Some(5), Some(7)]);
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_pixel_predecessor_no_lane_runs_does_not_discard_exported_lanes() {
+        // Both live ways into the end export; the block at 40 does not, and
+        // no lane gets there.
+        let words = [
+            UNIFORM_S2,
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0004, // s_cbranch_scc1 -> 28, uniform
+            0xBF85_0006, // 12: s_cbranch_scc1 -> 40: SCC is clear here, never taken
+            0xF800_180F,
+            0x0000_0000, // 16: exp mrt0 v0, v0, v0, v0 done vm
+            0xBF82_0004, // s_branch -> 44
+            0xF800_180F,
+            0x0101_0101, // 28: exp mrt0 v1, v1, v1, v1 done vm
+            0xBF82_0001, // s_branch -> 44
+            0x7E02_0280, // 40: v_mov_b32 v1, 0 (no lane gets here)
+            S_ENDPGM,    // 44
+        ];
+        let (st, shape) = lower_pixel(&words);
+        assert_eq!(decided(&st), 1, "{:?}", st.exits);
+        let discards = shape
+            .iter()
+            .flat_map(|b| &b.calls)
+            .filter(|c| *c == "dx.op.discard")
+            .count();
+        assert_eq!(discards, 0, "{shape:?}");
+        let stores = shape
+            .iter()
+            .flat_map(|b| &b.calls)
+            .filter(|c| c.starts_with("dx.op.storeOutput"))
+            .count();
+        assert_eq!(stores, 8, "{shape:?}");
     }
 }
