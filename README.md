@@ -109,7 +109,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=30:Enter,f900:X` | presses keys at those seconds, or (`f<n>`) at that presented frame, focus or not |
+| `VICTORY_PAD=f900:A,40:Menu` | the same for gamepad buttons (`A B X Y Menu View Up Down Left Right LB RB LS RS`), on the first pad the title sees |
+| `VICTORY_KEYS_ONLY=1` | only those scripts reach the title: host pads and keyboard left out |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
