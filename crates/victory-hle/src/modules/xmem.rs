@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -30,7 +30,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-use crate::{HleModule, hle_export};
+use crate::{HleExport, HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
@@ -161,6 +161,14 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() {
+        // What the GPU side remembers of this memory is stale.
+        if kind & MEM_RESERVE != 0 {
+            victory_gpu::title_reservation(at as usize, size, true);
+        } else {
+            victory_gpu::title_memory_changed(at as usize, size);
+        }
     }
     at
 }
@@ -318,7 +326,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let freed = victory_gpu::allocation_of(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
+            if let Some((base, end)) = freed {
+                victory_gpu::title_reservation(base, end - base, false);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -370,6 +382,50 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The same views by what they show: (section, first slice, address).
+    shown: BTreeSet<(usize, usize, usize)>,
+    /// Per section, the most slices a view of it has shown.
+    longest: HashMap<usize, usize>,
+}
+
+/// A section's key in [`Physical::shown`].
+fn key(section: &Arc<Section>) -> usize {
+    Arc::as_ptr(section) as usize
+}
+
+impl Physical {
+    fn add_view(&mut self, base: usize, len: usize, slice: Slice) {
+        let section = key(&slice.section);
+        self.shown.insert((section, slice.index, base));
+        let longest = self.longest.entry(section).or_default();
+        *longest = (*longest).max(len.div_ceil(PAGE));
+        self.views.insert(base, (len, slice));
+    }
+
+    fn remove_view(&mut self, base: usize) -> Option<(usize, Slice)> {
+        let (len, slice) = self.views.remove(&base)?;
+        self.shown.remove(&(key(&slice.section), slice.index, base));
+        Some((len, slice))
+    }
+
+    /// The title addresses that show bytes `[from, to)` of `section`
+    /// (offsets in it): (address, length) per view.
+    fn showing(&self, section: &Arc<Section>, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let section = key(section);
+        let Some(&longest) = self.longest.get(&section) else {
+            return Vec::new();
+        };
+        let first = (from / PAGE).saturating_sub(longest.saturating_sub(1));
+        self.shown
+            .range((section, first, 0)..(section, to.div_ceil(PAGE), 0))
+            .filter_map(|&(_, index, base)| {
+                let (len, _) = self.views.get(&base)?;
+                let (start, end) = (index * PAGE, index * PAGE + len);
+                let (a, b) = (from.max(start), to.min(end));
+                (a < b).then_some((base + (a - start), b - a))
+            })
+            .collect()
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -587,6 +643,59 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
+/// The runtime writes title memory `[at, at + len)` through these
+/// addresses (DirectStorage's address destinations). Titles may show the
+/// same physical pages at other addresses too (Grand Theft Auto VI gives
+/// the GPU a second mapping of what it streams), and a write here does not
+/// trip the guards host copies keep there ([`victory_gpu::kernel_will_write`]):
+/// opens them, and those here, for each view the range covers.
+pub(crate) fn open_aliases(at: usize, len: usize) {
+    let physical = physical();
+    let (mut a, end) = (at, at.saturating_add(len));
+    while a < end {
+        let Some((&base, (size, slice))) = physical
+            .views
+            .range(..=a)
+            .next_back()
+            .filter(|(base, (size, _))| a < *base + size)
+        else {
+            // Not a view here: on to the next view in the range, if any.
+            match physical.views.range(a..end).next() {
+                Some((&next, _)) => {
+                    a = next;
+                    continue;
+                }
+                None => break,
+            }
+        };
+        let piece_end = end.min(base + size);
+        let from = slice.index * PAGE + (a - base);
+        for (shown, n) in physical.showing(&slice.section, from, from + (piece_end - a)) {
+            victory_gpu::kernel_will_write(shown, n);
+        }
+        a = piece_end;
+    }
+}
+
+/// The runtime writes bytes `[offset, offset + len)` of physical pages
+/// through a view of its own (DirectStorage's page destinations): opens the
+/// guards host copies keep at every title address that shows them.
+pub(crate) fn open_page_views(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let physical = physical();
+    let (mut within, mut done) = (offset % PAGE, 0);
+    for (slice, n) in &runs {
+        let k = (n * PAGE - within).min(len - done);
+        let from = slice.index * PAGE + within;
+        for (shown, n) in physical.showing(&slice.section, from, from + k) {
+            victory_gpu::kernel_will_write(shown, n);
+        }
+        (within, done) = (0, done + k);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -719,16 +828,18 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             error = %std::io::Error::last_os_error(),
             "mapping physical pages failed (not a placeholder?)"
         );
+        victory_gpu::title_memory_changed(base, len);
         return false;
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        victory_gpu::title_memory_changed(base, len);
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
-    physical.views.insert(base, (len, slice));
+    physical.add_view(base, len, slice);
     true
 }
 
@@ -797,7 +908,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice)) = physical.remove_view(at) else {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
@@ -811,6 +922,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        victory_gpu::title_memory_changed(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -888,6 +1000,82 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own `VirtualAlloc` and `VirtualFree`: the host's, reporting
+/// each change of title memory to the GPU side, which remembers memory
+/// paths and unreadable pages until title memory changes there.
+mod own {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_RESERVE};
+    use windows_sys::core::BOOL;
+
+    pub(super) extern "system" fn VirtualAlloc(
+        base: *mut c_void,
+        size: usize,
+        kind: u32,
+        protect: u32,
+    ) -> *mut c_void {
+        // SAFETY: the title's own arguments, passed on as its import would.
+        let at = unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(base, size, kind, protect) };
+        if !at.is_null() {
+            // SAFETY: plain thread state, kept for the title.
+            let error = unsafe { GetLastError() };
+            if kind & MEM_RESERVE != 0 {
+                victory_gpu::title_reservation(at as usize, size, true);
+            } else {
+                victory_gpu::title_memory_changed(at as usize, size);
+            }
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+        }
+        at
+    }
+
+    pub(super) extern "system" fn VirtualFree(at: *mut c_void, size: usize, kind: u32) -> BOOL {
+        // Size 0 frees or decommits the whole allocation.
+        let range = if size == 0 {
+            victory_gpu::allocation_of(at as usize)
+        } else {
+            Some((at as usize, at as usize + size))
+        };
+        // SAFETY: the title's own arguments, passed on as its import would.
+        let done = unsafe { windows_sys::Win32::System::Memory::VirtualFree(at, size, kind) };
+        if done != 0
+            && let Some((from, to)) = range
+        {
+            // SAFETY: plain thread state, kept for the title.
+            let error = unsafe { GetLastError() };
+            if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 {
+                victory_gpu::title_reservation(from, to - from, false);
+            } else {
+                victory_gpu::title_memory_changed(from, to - from);
+            }
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+        }
+        done
+    }
+}
+
+/// [`own`]'s functions under the names the title imports them by (also
+/// looked up by name).
+pub(crate) fn memory_module() -> HleModule {
+    HleModule {
+        name: "memory",
+        dlls: &["api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
+        exports: vec![
+            HleExport {
+                name: "VirtualAlloc",
+                address: own::VirtualAlloc as *const () as usize,
+            },
+            HleExport {
+                name: "VirtualFree",
+                address: own::VirtualFree as *const () as usize,
+            },
+        ],
+    }
+}
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
