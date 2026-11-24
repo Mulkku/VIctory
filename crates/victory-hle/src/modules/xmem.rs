@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -370,6 +370,50 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The same views by what they show: (section, first slice, address).
+    shown: BTreeSet<(usize, usize, usize)>,
+    /// Per section, the most slices a view of it has shown.
+    longest: HashMap<usize, usize>,
+}
+
+/// A section's key in [`Physical::shown`].
+fn key(section: &Arc<Section>) -> usize {
+    Arc::as_ptr(section) as usize
+}
+
+impl Physical {
+    fn add_view(&mut self, base: usize, len: usize, slice: Slice) {
+        let section = key(&slice.section);
+        self.shown.insert((section, slice.index, base));
+        let longest = self.longest.entry(section).or_default();
+        *longest = (*longest).max(len.div_ceil(PAGE));
+        self.views.insert(base, (len, slice));
+    }
+
+    fn remove_view(&mut self, base: usize) -> Option<(usize, Slice)> {
+        let (len, slice) = self.views.remove(&base)?;
+        self.shown.remove(&(key(&slice.section), slice.index, base));
+        Some((len, slice))
+    }
+
+    /// The title addresses that show bytes `[from, to)` of `section`
+    /// (offsets in it): (address, length) per view.
+    fn showing(&self, section: &Arc<Section>, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let section = key(section);
+        let Some(&longest) = self.longest.get(&section) else {
+            return Vec::new();
+        };
+        let first = (from / PAGE).saturating_sub(longest.saturating_sub(1));
+        self.shown
+            .range((section, first, 0)..(section, to.div_ceil(PAGE), 0))
+            .filter_map(|&(_, index, base)| {
+                let (len, _) = self.views.get(&base)?;
+                let (start, end) = (index * PAGE, index * PAGE + len);
+                let (a, b) = (from.max(start), to.min(end));
+                (a < b).then_some((base + (a - start), b - a))
+            })
+            .collect()
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -587,6 +631,59 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
+/// The runtime writes title memory `[at, at + len)` through these
+/// addresses (DirectStorage's address destinations). Titles may show the
+/// same physical pages at other addresses too (Grand Theft Auto VI gives
+/// the GPU a second mapping of what it streams), and a write here does not
+/// trip the guards host copies keep there ([`victory_gpu::kernel_will_write`]):
+/// opens them, and those here, for each view the range covers.
+pub(crate) fn open_aliases(at: usize, len: usize) {
+    let physical = physical();
+    let (mut a, end) = (at, at.saturating_add(len));
+    while a < end {
+        let Some((&base, (size, slice))) = physical
+            .views
+            .range(..=a)
+            .next_back()
+            .filter(|(base, (size, _))| a < *base + size)
+        else {
+            // Not a view here: on to the next view in the range, if any.
+            match physical.views.range(a..end).next() {
+                Some((&next, _)) => {
+                    a = next;
+                    continue;
+                }
+                None => break,
+            }
+        };
+        let piece_end = end.min(base + size);
+        let from = slice.index * PAGE + (a - base);
+        for (shown, n) in physical.showing(&slice.section, from, from + (piece_end - a)) {
+            victory_gpu::kernel_will_write(shown, n);
+        }
+        a = piece_end;
+    }
+}
+
+/// The runtime writes bytes `[offset, offset + len)` of physical pages
+/// through a view of its own (DirectStorage's page destinations): opens the
+/// guards host copies keep at every title address that shows them.
+pub(crate) fn open_page_views(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let physical = physical();
+    let (mut within, mut done) = (offset % PAGE, 0);
+    for (slice, n) in &runs {
+        let k = (n * PAGE - within).min(len - done);
+        let from = slice.index * PAGE + within;
+        for (shown, n) in physical.showing(&slice.section, from, from + k) {
+            victory_gpu::kernel_will_write(shown, n);
+        }
+        (within, done) = (0, done + k);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -728,7 +825,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
-    physical.views.insert(base, (len, slice));
+    physical.add_view(base, len, slice);
     true
 }
 
@@ -797,7 +894,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice)) = physical.remove_view(at) else {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
