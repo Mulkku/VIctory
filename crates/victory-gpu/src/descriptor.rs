@@ -573,6 +573,31 @@ pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+/// Tests: a shader-visible view heap of `count` slots, allocated by us.
+#[cfg(all(test, windows))]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
+}
+
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
