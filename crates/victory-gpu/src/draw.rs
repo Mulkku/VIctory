@@ -689,24 +689,44 @@ impl State {
                 return false;
             };
             let checked = host.atomic64_at(index, &view);
-            // Each kind of view once: refused ones are what the title
-            // loses, the others what it binds.
+            // Each kind of view once (refused ones are what the title loses,
+            // the others what it binds), and the count of each outcome at
+            // powers of two.
             static SEEN: Mutex<Vec<Atomic64View>> = Mutex::new(Vec::new());
+            static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+            let (resource, format, outcome) = (checked.resource, checked.view, checked.outcome);
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
             if !seen.contains(&checked) {
                 seen.push(checked);
-                let (resource, view, outcome) = (checked.resource, checked.view, checked.outcome);
+                #[cfg(feature = "diagnostics")]
+                let described = describe(Some(&view));
+                #[cfg(not(feature = "diagnostics"))]
+                let described = "";
                 if outcome == Atomic64::Refused {
                     tracing::warn!(
                         resource,
-                        view,
+                        view = format,
+                        compute,
+                        %described,
                         "64-bit atomic view of another format; draw skipped"
                     );
                 } else {
-                    tracing::info!(resource, view, ?outcome, "64-bit atomic view");
+                    tracing::info!(
+                        resource,
+                        view = format,
+                        ?outcome,
+                        compute,
+                        %described,
+                        "64-bit atomic view"
+                    );
                 }
             }
-            if checked.outcome == Atomic64::Refused {
+            drop(seen);
+            let n = COUNTS[outcome as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(?outcome, n, "64-bit atomic views so far");
+            }
+            if outcome == Atomic64::Refused {
                 return false;
             }
             if let View::Unordered(resource, _, _) = view {
