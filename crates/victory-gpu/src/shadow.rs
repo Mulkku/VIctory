@@ -110,6 +110,14 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// The title range a refresh of `len` bytes at `address` checks (cut
+    /// to the buffer), if the memory is checked at all.
+    pub(crate) fn check_range(&self, address: usize, len: usize) -> Option<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        (from < to && self.watched.load(Ordering::Relaxed) != NOT_WATCHED).then_some((from, to))
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         Shadow::at(buffer, 0, data, gpu, start, len)
     }

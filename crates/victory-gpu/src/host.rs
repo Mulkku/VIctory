@@ -252,6 +252,59 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Reads of title memory that failed on this thread.
+        pub(super) static FAILED_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Unreadable pages of a title reservation are read (and fail) once,
+    /// then are zeros without a read; a reported commit there brings the
+    /// data back, a reported decommit zeros again (read and failing once).
+    #[test]
+    fn unmapped_pages_are_zero_filled_once() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation of the test's own.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        crate::watch::title_reservation(p, 4 * BLOCK, true);
+        let commit = |b: usize| {
+            let at = p + b * BLOCK;
+            // SAFETY: part of our reservation, then its bytes.
+            unsafe {
+                assert!(!VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                std::ptr::write_bytes(at as *mut u8, b as u8 + 1, BLOCK);
+            }
+            crate::watch::title_memory_changed(at, BLOCK);
+        };
+        commit(0);
+        commit(2);
+        let mut dst = vec![0u8; 4 * BLOCK];
+        let mut copy = |blocks: [u8; 4]| {
+            FAILED_READS.set(0);
+            dst.fill(0xaa);
+            copy_mapped(dst.as_mut_ptr(), p as *const u8, 4 * BLOCK, false);
+            for (b, &v) in blocks.iter().enumerate() {
+                assert!(dst[b * BLOCK..(b + 1) * BLOCK].iter().all(|&x| x == v), "block {b} reads {v}");
+            }
+            FAILED_READS.get()
+        };
+        assert!(copy([1, 0, 3, 0]) > 0, "the first copy reads (and fails)");
+        assert_eq!(copy([1, 0, 3, 0]), 0, "remembered: no failing reads");
+        commit(1);
+        assert_eq!(copy([1, 2, 3, 0]), 0, "a reported commit is read");
+        // SAFETY: a committed block of ours.
+        assert_ne!(unsafe { VirtualFree((p + 2 * BLOCK) as *mut _, BLOCK, MEM_DECOMMIT) }, 0);
+        crate::watch::title_memory_changed(p + 2 * BLOCK, BLOCK);
+        assert!(copy([1, 2, 0, 0]) > 0, "a decommitted block is read (and fails) again");
+        assert_eq!(copy([1, 2, 0, 0]), 0, "then remembered");
+        // SAFETY: our reservation.
+        assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
+        crate::watch::title_reservation(p, 4 * BLOCK, false);
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -450,8 +503,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// Work that may write title memory, and the range (address, bytes) it
+    /// may write.
+    Run(Box<dyn Fn() + Send>, (usize, usize)),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
@@ -640,6 +694,23 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        {
+            // One write-watch asking per allocation for the whole
+            // preparation.
+            let mut ranges = Vec::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    match step {
+                        Step::Refresh(shadow, address, len) => {
+                            ranges.extend(shadow.check_range(*address, *len));
+                        }
+                        Step::Texture(staging) => ranges.push(staging.memory_range()),
+                        _ => {}
+                    }
+                }
+            }
+            crate::watch::begin_submission(ranges);
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -649,6 +720,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        crate::watch::end_submission();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1364,9 +1436,10 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    /// `work` may write title memory `[at, at + len)` (`writes`; refreshes
+    /// after it copy again).
+    pub(crate) fn defer(&self, writes: (usize, usize), work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Run(Box::new(work), writes));
         self.deferred().refreshed.clear();
     }
 
@@ -1398,6 +1471,7 @@ impl HostList {
                     }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::watch::note_written(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1418,11 +1492,14 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                Step::Run(work, _) | Step::Host(work) => {
+                    if matches!(step, Step::Run(..)) {
                         batch.title_written();
                     }
                     work();
+                    if let &Step::Run(_, (at, len)) = step {
+                        crate::watch::note_written(at, len);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -1530,9 +1607,35 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    // Pages remembered unreadable are zeros without a read; the rest is
+    // read, and what fails remembered.
+    let seen = crate::watch::changes();
+    let known = crate::watch::unmapped_in(src as usize, len);
+    let (start, end) = (src as usize, src as usize + len);
+    let mut failed = Vec::new();
+    let mut at = start;
+    for (a, b) in known.into_iter().chain([(end, end)]) {
+        if at < a {
+            read_mapped(dst.wrapping_add(at - start), at, a - at, &mut failed);
+        }
+        if a < b {
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { dst.wrapping_add(a - start).write_bytes(0, b - a) };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
+        }
+        at = at.max(b);
+    }
+    crate::watch::note_unmapped(&failed, seen);
+}
+
+/// [`copy_mapped`]'s read of `len` bytes at `src` into `dst`: whole, else
+/// page by page (64 KiB, then 4 KiB in a piece that fails), zeros for what
+/// cannot be read; the 4 KiB pieces that failed are added to `failed`.
+fn read_mapped(dst: *mut u8, src: usize, len: usize, failed: &mut Vec<(usize, usize)>) {
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read(src as *const u8, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1540,16 +1643,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
+    for_pieces(src, len, 64 << 10, |at, n| {
+        let to = dst.wrapping_add(at - src);
         if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
+                let to = dst.wrapping_add(at - src);
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    failed.push((at, at + n));
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
@@ -1572,7 +1674,12 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let read = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    #[cfg(test)]
+    if !read {
+        tests::FAILED_READS.set(tests::FAILED_READS.get() + 1);
+    }
+    read
 }
 
 /// Copies host memory into title memory after a submission (what shaders

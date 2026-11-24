@@ -30,7 +30,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-use crate::{HleModule, hle_export};
+use crate::{HleExport, HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
@@ -161,6 +161,14 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() {
+        // What the GPU side remembers of this memory is stale.
+        if kind & MEM_RESERVE != 0 {
+            victory_gpu::title_reservation(at as usize, size, true);
+        } else {
+            victory_gpu::title_memory_changed(at as usize, size);
+        }
     }
     at
 }
@@ -318,7 +326,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let freed = victory_gpu::allocation_of(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
+            if let Some((base, end)) = freed {
+                victory_gpu::title_reservation(base, end - base, false);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -816,11 +828,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             error = %std::io::Error::last_os_error(),
             "mapping physical pages failed (not a placeholder?)"
         );
+        victory_gpu::title_memory_changed(base, len);
         return false;
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        victory_gpu::title_memory_changed(base, len);
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
@@ -908,6 +922,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        victory_gpu::title_memory_changed(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -985,6 +1000,82 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own `VirtualAlloc` and `VirtualFree`: the host's, reporting
+/// each change of title memory to the GPU side, which remembers memory
+/// paths and unreadable pages until title memory changes there.
+mod own {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_RESERVE};
+    use windows_sys::core::BOOL;
+
+    pub(super) extern "system" fn VirtualAlloc(
+        base: *mut c_void,
+        size: usize,
+        kind: u32,
+        protect: u32,
+    ) -> *mut c_void {
+        // SAFETY: the title's own arguments, passed on as its import would.
+        let at = unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(base, size, kind, protect) };
+        if !at.is_null() {
+            // SAFETY: plain thread state, kept for the title.
+            let error = unsafe { GetLastError() };
+            if kind & MEM_RESERVE != 0 {
+                victory_gpu::title_reservation(at as usize, size, true);
+            } else {
+                victory_gpu::title_memory_changed(at as usize, size);
+            }
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+        }
+        at
+    }
+
+    pub(super) extern "system" fn VirtualFree(at: *mut c_void, size: usize, kind: u32) -> BOOL {
+        // Size 0 frees or decommits the whole allocation.
+        let range = if size == 0 {
+            victory_gpu::allocation_of(at as usize)
+        } else {
+            Some((at as usize, at as usize + size))
+        };
+        // SAFETY: the title's own arguments, passed on as its import would.
+        let done = unsafe { windows_sys::Win32::System::Memory::VirtualFree(at, size, kind) };
+        if done != 0
+            && let Some((from, to)) = range
+        {
+            // SAFETY: plain thread state, kept for the title.
+            let error = unsafe { GetLastError() };
+            if kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 {
+                victory_gpu::title_reservation(from, to - from, false);
+            } else {
+                victory_gpu::title_memory_changed(from, to - from);
+            }
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+        }
+        done
+    }
+}
+
+/// [`own`]'s functions under the names the title imports them by (also
+/// looked up by name).
+pub(crate) fn memory_module() -> HleModule {
+    HleModule {
+        name: "memory",
+        dlls: &["api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
+        exports: vec![
+            HleExport {
+                name: "VirtualAlloc",
+                address: own::VirtualAlloc as *const () as usize,
+            },
+            HleExport {
+                name: "VirtualFree",
+                address: own::VirtualFree as *const () as usize,
+            },
+        ],
+    }
+}
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
