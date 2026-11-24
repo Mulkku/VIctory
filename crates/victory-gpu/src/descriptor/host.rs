@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -14,6 +14,7 @@ use victory_shader::emit::{DeclaredView, ViewKind};
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -376,7 +377,7 @@ impl HostHeap {
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+            let host = buffer_copy(&view).map(|(s, ..)| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
@@ -414,8 +415,6 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
-/// A buffer view of title memory at `address` on its host copy: the first
-/// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
 fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     // SAFETY: a buffer view's union member.
@@ -429,66 +428,78 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
-pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
-        View::Placed(false, resource, desc) if resource[0] == 1 => (
-            u64::from(desc[10]) | u64::from(desc[11]) << 32,
-            desc[..10].try_into().ok()?,
-        ),
-        View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
-        }
-        View::Placed(true, resource, desc) if resource[0] == 1 => {
-            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
-        }
-        _ => return None,
-    };
-    let desc = srv_desc(words);
-    let element = element_size(&desc);
+/// Bytes per element of an unordered access buffer view.
+fn unordered_element(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> u64 {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
-}
-
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
-    let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// The title memory a buffer shader or unordered access view reads (its
+/// address and length) and its bytes per element (0: unknown).
+fn buffer_extent(view: &View) -> Option<(u64, u64, u64)> {
+    let (unordered, base, words): (bool, u64, &[u32; 10]) = match view {
+        View::Shader(r, Some(desc)) => (
+            false,
+            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+            desc,
+        ),
+        View::Unordered(r, _, Some(desc)) => (
+            true,
+            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+            desc,
+        ),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => (
+            *unordered,
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            desc[..10].try_into().ok()?,
+        ),
+        _ => return None,
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    let (first, count, element) = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (b.FirstElement, b.NumElements, unordered_element(&desc))
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (b.FirstElement, b.NumElements, element_size(&desc))
+    };
+    Some((base + first * element, u64::from(count) * element, element))
+}
+
+/// The title memory a buffer shader or unordered access view reads: its
+/// address and length.
+pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+    buffer_extent(view).map(|(address, len, _)| (address, len))
+}
+
+/// The host copy the host view of a buffer view is made on (see
+/// [`crate::shadow::find_on`]), with the view's [`buffer_range`].
+pub(crate) fn buffer_copy(view: &View) -> Option<(Arc<Shadow>, u64, u64)> {
+    let (address, len, element) = buffer_extent(view)?;
+    Some((crate::shadow::find_on(address, len, element)?, address, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+/// A buffer shader view of `view` (described by `desc`) on the host copy
+/// [`buffer_copy`] gives: the first element is the range's in the copy.
 fn buffer_srv(
-    address: u64,
-    len: u64,
+    view: &View,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let (shadow, address, _) = buffer_copy(view)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -501,7 +512,7 @@ fn buffer_srv(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = offset / element;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -511,39 +522,31 @@ fn buffer_srv(
     Some(Some(shadow.buffer.clone()))
 }
 
-/// An unordered access view of title buffer memory at `address` (`len`
-/// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
-/// written by shaders (upload memory).
+/// An unordered access view of title buffer memory as [`buffer_srv`];
+/// `None` if the copy cannot be written by shaders (upload memory).
 /// shortcut: what shaders write stays in the host copy; title memory (and
 /// so the CPU, and copies run on the CPU) does not see it.
 fn buffer_uav(
-    address: u64,
-    len: u64,
+    view: &View,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let (shadow, address, _) = buffer_copy(view)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
+    let element = unordered_element(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = offset / element;
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -647,10 +650,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     )
                 };
                 Some(Some(texture.clone()))
-            } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::buffer_bytes(resource), desc)
-            {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+            } else if let Some(desc) = desc {
+                buffer_srv(view, srv_desc(desc), at)
             } else {
                 None
             }
@@ -658,12 +659,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
             let Some(texture) = crate::resource::host_resource(resource) else {
-                return match (crate::resource::buffer_bytes(resource), desc) {
-                    (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
-                    }
-                    _ => None,
-                };
+                return desc.as_ref().and_then(|desc| buffer_uav(view, uav_desc(desc), at));
             };
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
@@ -709,14 +705,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
                 return None;
             }
-            // The resource description's width, after the alignment.
-            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
-            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(view, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(view, srv_desc(words), at)
             }
         }
     }
