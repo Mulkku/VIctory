@@ -47,7 +47,15 @@ fn translate(
     let isg1 = container::signature(inputs, true);
     let osg1 = container::signature(outputs, false);
     let bytes = container::build(&[(b"ISG1", &isg1[..]), (b"OSG1", &osg1[..])]);
-    emit(&Container::parse(&bytes)?, &native, &p, &st, &io, &res)
+    emit(
+        &Container::parse(&bytes)?,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        None,
+    )
 }
 
 fn pixel(input_addr: u32, inputs: Vec<PsInput>) -> NativeProgram {

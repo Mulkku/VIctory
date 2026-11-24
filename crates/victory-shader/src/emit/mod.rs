@@ -220,6 +220,215 @@ impl HostShader {
     }
 }
 
+/// The most bytes of vertex plus primitive outputs the validator allows a
+/// mesh shader.
+pub const MESH_OUTPUT_LIMIT: u32 = 32768;
+
+/// The inputs of the translated pixel shader a vertex or mesh shader
+/// feeds, for [`translate_linked`]: the elements the previous stage
+/// provides (arbitrary, position, clip and cull) as its `PSV0` lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    inputs: Vec<container::SigElement>,
+}
+
+impl Link {
+    pub fn pixel(ps: &HostShader) -> Result<Self, ShaderError> {
+        let [inputs, ..] =
+            psv_elements(&ps.dxil).ok_or(ShaderError::Malformed("a pixel shader without PSV0"))?;
+        let inputs = inputs
+            .into_iter()
+            .filter(|e| matches!(e.kind, 0 | 3 | 6 | 7))
+            .map(|e| container::SigElement {
+                name: e.name,
+                index: e.index,
+                kind: e.kind,
+                comp: match e.comp {
+                    1 => 5,
+                    2 => 4,
+                    _ => 9,
+                },
+                interp: e.interp,
+                row: Some(u32::from(e.row)),
+                col: e.col,
+                cols: e.cols,
+                usage: 0,
+                half: false,
+                console_read: true,
+            })
+            .collect();
+        Ok(Self { inputs })
+    }
+
+    /// The pixel input that reads `e`: the same semantic.
+    fn reads(&self, e: &container::SigElement) -> Option<&container::SigElement> {
+        self.inputs.iter().find(|i| {
+            i.kind == e.kind
+                && i.index == e.index
+                && (e.kind != 0 || i.name.eq_ignore_ascii_case(&e.name))
+        })
+    }
+
+    /// What a shader writing `outputs` and `prims` (the console's
+    /// elements) declares linked: each element the pixel shader reads in
+    /// the input's place (row, columns, type and mode); a system value it
+    /// does not read on a row of its own past the pixel shader's; other
+    /// elements left out; and the inputs nothing writes, declared unwritten
+    /// so the stages link.
+    fn declare(
+        &self,
+        outputs: &[container::SigElement],
+        prims: &[container::SigElement],
+    ) -> lower::Linked {
+        let mut free = self
+            .inputs
+            .iter()
+            .filter_map(|i| i.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        let mut written = Vec::new();
+        let mut place = |elements: &[container::SigElement],
+                         declared: &mut Vec<container::SigElement>| {
+            elements
+                .iter()
+                .map(|e| {
+                    let at = match self.reads(e) {
+                        Some(i) => {
+                            written.push(i.clone());
+                            // The name as the shader writes it (`PSV0`
+                            // leaves system values unnamed).
+                            container::SigElement {
+                                name: e.name.clone(),
+                                usage: 0,
+                                half: e.half,
+                                ..i.clone()
+                            }
+                        }
+                        None if e.kind != 0 && e.row.is_some() => {
+                            free += 1;
+                            container::SigElement {
+                                row: Some(free - 1),
+                                col: 0,
+                                usage: 0,
+                                ..e.clone()
+                            }
+                        }
+                        None => return None,
+                    };
+                    declared.push(at);
+                    Some(declared.len() - 1)
+                })
+                .collect()
+        };
+        let mut linked = lower::Linked::default();
+        linked.out_ids = place(outputs, &mut linked.outputs);
+        linked.prim_ids = place(prims, &mut linked.prims);
+        for i in &self.inputs {
+            if i.kind == 0 && !written.contains(i) {
+                linked.outputs.push(i.clone());
+            }
+        }
+        linked
+    }
+}
+
+/// How a pixel shader's inputs fail to link to a vertex or mesh shader's
+/// outputs (both translated), from their `PSV0` parts: per arbitrary,
+/// position, clip or cull input, an output (or per-primitive output) of
+/// the same semantic must sit at the same row and first column, cover the
+/// input's columns and use the same interpolation mode. Empty when they
+/// link.
+pub fn link_mismatches(first: &HostShader, ps: &HostShader) -> Vec<String> {
+    let (Some([_, outputs, prims]), Some([inputs, ..])) =
+        (psv_elements(&first.dxil), psv_elements(&ps.dxil))
+    else {
+        return vec!["no PSV0".to_owned()];
+    };
+    let mut out = Vec::new();
+    for i in inputs.iter().filter(|i| matches!(i.kind, 0 | 3 | 6 | 7)) {
+        let what = format!("{}{}", i.name, i.index);
+        let same = |o: &&PsvElement| {
+            o.kind == i.kind && o.index == i.index && o.name.eq_ignore_ascii_case(&i.name)
+        };
+        let Some(o) = outputs.iter().chain(&prims).find(same) else {
+            out.push(format!("{what} not written"));
+            continue;
+        };
+        if o.row != i.row || o.col != i.col || o.cols < i.cols {
+            out.push(format!(
+                "{what} at {}.{}+{} read at {}.{}+{}",
+                o.row, o.col, o.cols, i.row, i.col, i.cols
+            ));
+        }
+        if o.interp != i.interp {
+            out.push(format!("{what} mode {} read as {}", o.interp, i.interp));
+        }
+    }
+    out
+}
+
+/// A signature element as `PSV0` lists it.
+struct PsvElement {
+    name: String,
+    index: u32,
+    row: u8,
+    col: u8,
+    cols: u8,
+    kind: u8,
+    comp: u8,
+    interp: u8,
+}
+
+/// The inputs, outputs and per-primitive outputs a translated shader's
+/// `PSV0` lists (the layout [`container::psv`] writes).
+fn psv_elements(dxil: &[u8]) -> Option<[Vec<PsvElement>; 3]> {
+    let c = Container::parse(dxil).ok()?;
+    let d = c.part(FourCC::PSV0)?.data;
+    let word = |at: usize| crate::dxbc::u32_at(d, at).ok().map(|v| v as usize);
+    let info = word(0)?;
+    let counts = [*d.get(4 + 28)?, *d.get(4 + 29)?, *d.get(4 + 30)?];
+    let mut at = 4 + info;
+    let bindings = word(at)?;
+    at += 4;
+    if bindings > 0 {
+        at += 4 + word(at)? * bindings;
+    }
+    let strings = d.get(at + 4..at + 4 + word(at)?)?;
+    at += 4 + strings.len();
+    let indices = word(at)?;
+    let index_at = at + 4;
+    at += 4 + 4 * indices;
+    let size = match counts.iter().map(|&n| usize::from(n)).sum::<usize>() {
+        0 => 0,
+        _ => {
+            at += 4;
+            word(at - 4)?
+        }
+    };
+    let mut lists: [Vec<PsvElement>; 3] = Default::default();
+    let mut k = 0;
+    for (list, n) in lists.iter_mut().zip(counts) {
+        for _ in 0..n {
+            let e = at + size * k;
+            k += 1;
+            let name = strings.get(word(e)?..)?.split(|&b| b == 0).next()?;
+            let b = d.get(e + 8..e + 14)?;
+            list.push(PsvElement {
+                name: String::from_utf8_lossy(name).into_owned(),
+                index: word(index_at + 4 * word(e + 4)?)? as u32,
+                row: b[1],
+                col: b[2] >> 4 & 3,
+                cols: b[2] & 0xf,
+                kind: b[3],
+                comp: b[4],
+                interp: b[5],
+            });
+        }
+    }
+    Some(lists)
+}
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -557,7 +766,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
+        if let Err(e) = emit(&c, &native, &p, &st, &io, &res, None) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
     }
@@ -611,6 +820,135 @@ mod tests {
         super::uniform_rows(&mut sig);
         let modes: Vec<u8> = sig.iter().map(|e| e.interp).collect();
         assert_eq!(modes, [1, 1, 2, 2]);
+    }
+
+    fn element(name: &str, kind: u8, row: u32, cols: u8, interp: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+            console_read: true,
+        }
+    }
+
+    /// A translated shader with these signatures and no code.
+    fn shell(
+        stage: crate::HwStage,
+        ins: Vec<SigElement>,
+        outs: Vec<SigElement>,
+    ) -> super::HostShader {
+        let mut s = Shader::new(stage == crate::HwStage::Ps);
+        s.inputs = ins;
+        s.outputs = outs;
+        if stage == crate::HwStage::Ms {
+            s.prims = vec![element("PRIM", 0, 0, 1, 1)];
+            s.threads = Some([128, 1, 1]);
+            s.mesh = Some(super::shader::Mesh {
+                max_vertices: 100,
+                max_primitives: 64,
+                topology: 2,
+            });
+        }
+        let b = s.entry;
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        super::HostShader {
+            stage,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mesh_outputs_count_every_component_of_32_rounded_maxima() {
+        let outs = vec![
+            element("SV_Position", 3, 0, 4, 4),
+            element("TEXCOORD", 0, 1, 3, 2),
+        ];
+        let ms = shell(crate::HwStage::Ms, Vec::new(), outs);
+        assert_eq!(ms.mesh_output_bytes(), 4 * (7 * 128 + 64));
+        let vs = shell(crate::HwStage::Vs, Vec::new(), Vec::new());
+        assert_eq!(vs.mesh_output_bytes(), 0);
+    }
+
+    #[test]
+    fn pixel_inputs_link_at_the_rows_and_modes_written() {
+        let vs = shell(
+            crate::HwStage::Vs,
+            Vec::new(),
+            vec![
+                element("SV_Position", 3, 0, 4, 4),
+                element("TEXCOORD", 0, 1, 4, 2),
+            ],
+        );
+        let ps = |row, interp| {
+            shell(
+                crate::HwStage::Ps,
+                vec![
+                    element("SV_Position", 3, 0, 4, 4),
+                    element("TEXCOORD", 0, row, 2, interp),
+                ],
+                vec![element("SV_Target", 16, 0, 4, 0)],
+            )
+        };
+        assert!(super::link_mismatches(&vs, &ps(1, 2)).is_empty());
+        assert_eq!(
+            super::link_mismatches(&vs, &ps(2, 2)),
+            ["TEXCOORD0 at 1.0+4 read at 2.0+2"]
+        );
+        assert_eq!(
+            super::link_mismatches(&vs, &ps(1, 1)),
+            ["TEXCOORD0 mode 2 read as 1"]
+        );
+    }
+
+    #[test]
+    fn links_place_outputs_where_the_pixel_shader_reads_them() {
+        let mut texcoord = element("TEXCOORD", 0, 1, 2, 1);
+        texcoord.col = 2;
+        texcoord.comp = 5;
+        let color = element("COLOR", 0, 2, 4, 2);
+        // `PSV0` names no system value.
+        let link = super::Link {
+            inputs: vec![element("", 3, 0, 4, 4), texcoord.clone(), color.clone()],
+        };
+        let mut unread = element("TEXCOORD", 0, 6, 4, 2);
+        unread.index = 1;
+        let outputs = [
+            element("TEXCOORD", 0, 5, 4, 2),
+            unread,
+            element("SV_Position", 3, 2, 4, 4),
+            element("SV_ClipDistance", 6, 7, 1, 2),
+        ];
+        let linked = link.declare(&outputs, &[]);
+        assert_eq!(linked.out_ids, [Some(0), None, Some(1), Some(2)]);
+        let rows: Vec<_> = linked
+            .outputs
+            .iter()
+            .map(|e| (e.row, e.col, e.cols))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(1), 2, 2),
+                (Some(0), 0, 4),
+                (Some(3), 0, 1),
+                (Some(2), 0, 4)
+            ]
+        );
+        assert_eq!(linked.outputs[1].name, "SV_Position");
+        assert_eq!((linked.outputs[0].comp, linked.outputs[0].interp), (5, 1));
+        assert_eq!(linked.outputs[3], color);
     }
 
     #[test]
@@ -731,6 +1069,6 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
-        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+        let _ = super::emit(&c, &native, &p, &st, &io, &res, None);
     }
 }

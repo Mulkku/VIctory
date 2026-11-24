@@ -536,6 +536,167 @@ fn check(
     }
 }
 
+/// The pipelines of `VICTORY_PAIRS`: a mesh shader whose outputs exceed
+/// the validator's limit is translated again declaring only what the
+/// pixel shader reads (`emit::translate_linked`), as the host pipeline
+/// path does; each pair reports the output bytes, the validator's verdict
+/// on the first stage, how the signatures link (`emit::link_mismatches`)
+/// and, with `--pipelines`, whether the host creates the pipeline
+/// (`VICTORY_D3D12_WARP` set: on WARP).
+fn link_pairs(
+    pairs: &[(String, String)],
+    kept: &Kept,
+    dll: Option<&Path>,
+    pipelines: bool,
+) -> Result<()> {
+    let host = match pipelines {
+        true => Some(
+            Host::new(std::env::var_os("VICTORY_D3D12_WARP").is_some())
+                .map_err(anyhow::Error::msg)?,
+        ),
+        false => None,
+    };
+    let mut validator = Validator::load(dll).ok();
+    let find = |name: &str| {
+        let dxil = kept
+            .aliases
+            .iter()
+            .find(|(h, _)| h.starts_with(name))
+            .map(|a| a.1);
+        kept.shaders
+            .iter()
+            .find(|k| k.hash.starts_with(name) || dxil == Some(k.dxil) || k.label.contains(name))
+    };
+    let mut list: Vec<(&KeptShader, &KeptShader)> = Vec::new();
+    let mut missing = 0;
+    for (first, ps) in pairs {
+        if first == "oversized" {
+            list.extend(oversized_pairs(kept));
+            continue;
+        }
+        match (find(first), find(ps)) {
+            (Some(a), Some(b)) => list.push((a, b)),
+            _ => {
+                missing += 1;
+                println!("pair {first} + {ps}: not emitted");
+            }
+        }
+    }
+    let (mut fit, mut validated, mut linked_ok, mut created) = (0, 0, 0, 0);
+    let (mut oversized, mut unlinked) = (0, 0);
+    for (first, ps) in &list {
+        // As the host pipeline path does: the first stage translated again
+        // in the pixel shader's input layout when it is too big or does
+        // not link as it stands.
+        let before = first.shader.mesh_output_bytes();
+        let unlinking = emit::link_mismatches(&first.shader, &ps.shader).len();
+        oversized += usize::from(before > emit::MESH_OUTPUT_LIMIT);
+        unlinked += usize::from(unlinking > 0);
+        let relink = before > emit::MESH_OUTPUT_LIMIT || unlinking > 0;
+        let linked = if relink {
+            emit::Link::pixel(&ps.shader)
+                .and_then(|l| emit::translate_linked(&first.container, Some(&l)))
+                .map_err(|e| format!("linked translation: {e}"))
+        } else {
+            Ok(first.shader.clone())
+        };
+        let result = linked.map(|s| {
+            let after = s.mesh_output_bytes();
+            fit += usize::from(after <= emit::MESH_OUTPUT_LIMIT);
+            let verdict = match validator.as_mut().map(|v| v.validate(&mut s.dxil.clone())) {
+                Some(Ok(())) => {
+                    validated += 1;
+                    "validated".to_owned()
+                }
+                Some(Err(text)) => text
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or("validator error")
+                    .to_owned(),
+                None => "not validated".to_owned(),
+            };
+            let mismatches = emit::link_mismatches(&s, &ps.shader);
+            let link = if mismatches.is_empty() {
+                linked_ok += 1;
+                "signatures link".to_owned()
+            } else {
+                format!("signatures: {}", mismatches.join(", "))
+            };
+            let made = host.as_ref().map(|host| {
+                let made = if s.stage == HwStage::Ms {
+                    host.mesh_pipeline(&s, &ps.shader)
+                } else {
+                    host.pipeline(&s, &ps.shader)
+                };
+                match made {
+                    Ok(_) => {
+                        created += 1;
+                        "; pipeline created".to_owned()
+                    }
+                    Err(e) => format!("; pipeline: {e}"),
+                }
+            });
+            let made = made.unwrap_or_default();
+            let how = if relink { "relinked" } else { "as is" };
+            format!(
+                "outputs {before} -> {after} bytes, {unlinking} link mismatches; {how}; \
+                 {verdict}; {link}{made}"
+            )
+        });
+        let line = result.unwrap_or_else(|e| e);
+        println!("pair {} + {}: {line}", first.label, ps.label);
+    }
+    println!(
+        "pairs        {} found ({missing} not emitted), before: {oversized} past the output \
+         limit, {unlinked} not linking; after: {fit} within the limit, {validated} validated, \
+         {linked_ok} linking, {created} pipelines",
+        list.len()
+    );
+    Ok(())
+}
+
+/// Every mesh shader past the output limit with the pixel shaders of its
+/// effect: the same name suffix (`<name>_<8 hex>_Wrapped`), one per pixel
+/// shader name, the record nearest the mesh shader's in the same file.
+fn oversized_pairs(kept: &Kept) -> Vec<(&KeptShader, &KeptShader)> {
+    // (file, record offset, effect suffix, shader name) of a label.
+    let parse = |label: &str| {
+        let (file, rest) = label.split_once('@')?;
+        let (offset, rest) = rest.split_once(' ')?;
+        let offset = u64::from_str_radix(offset.trim_start_matches("0x"), 16).ok()?;
+        let name = rest.split(' ').next()?.strip_suffix("_Wrapped")?;
+        let (_, effect) = name.rsplit_once('_')?;
+        Some((file.to_owned(), offset, effect.to_owned(), name.to_owned()))
+    };
+    let pixels: Vec<_> = kept
+        .shaders
+        .iter()
+        .filter(|k| k.shader.stage == HwStage::Ps)
+        .filter_map(|k| Some((parse(&k.label)?, k)))
+        .collect();
+    let mut out = Vec::new();
+    for ms in kept.shaders.iter().filter(|k| {
+        k.shader.stage == HwStage::Ms && k.shader.mesh_output_bytes() > emit::MESH_OUTPUT_LIMIT
+    }) {
+        let Some((file, offset, effect, _)) = parse(&ms.label) else {
+            continue;
+        };
+        let mut nearest: BTreeMap<&str, (u64, &KeptShader)> = BTreeMap::new();
+        for ((f, o, e, name), ps) in &pixels {
+            if *f != file || *e != effect {
+                continue;
+            }
+            let d = o.abs_diff(offset);
+            let best = nearest.entry(name).or_insert((d, ps));
+            if d < best.0 {
+                *best = (d, ps);
+            }
+        }
+        out.extend(nearest.into_values().map(|(_, ps)| (ms, ps)));
+    }
+    out
+}
+
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
 /// 3 pipelines.
 fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {

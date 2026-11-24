@@ -427,6 +427,85 @@ fn manual_rows(
     manual
 }
 
+/// What a vertex or mesh shader linked to a pixel shader declares: its
+/// outputs and per-primitive outputs, and per element of
+/// [`Parts::outputs`] and [`Parts::prims`] the declared one (none: the
+/// stores to it are dropped).
+#[derive(Debug, Default)]
+pub(crate) struct Linked {
+    pub outputs: Vec<SigElement>,
+    pub out_ids: Vec<Option<usize>>,
+    pub prims: Vec<SigElement>,
+    pub prim_ids: Vec<Option<usize>>,
+}
+
+/// Whether a pixel program's exports give the console's targets: a last
+/// export (`done`) discards the lanes outside EXEC, any other export
+/// writes only the lanes that run it, and a target a surviving lane
+/// skipped keeps its value on the console but is undefined on PC. Exact
+/// when every lane reaching a last export that can keep lanes ran an
+/// export of each target the program writes on its way there, with no
+/// condition or the last export's own (a condition differing anywhere is
+/// not followed).
+fn exact_exports(x: &Parts) -> bool {
+    let all: Vec<_> =
+        x.io.exports
+            .iter()
+            .map(|e| (e.target, e.site.0, x.st.guards[e.site.0][e.site.1], e.done))
+            .collect();
+    let mut targets: Vec<Target> = Vec::new();
+    for e in &all {
+        if e.0 != Target::Null && !targets.contains(&e.0) {
+            targets.push(e.0);
+        }
+    }
+    all.iter()
+        .filter(|&&(_, _, g, done)| done && g != Some(Bool::FALSE))
+        .all(|&(_, block, guard, _)| {
+            targets.iter().all(|&t| {
+                let writes: Vec<_> = all.iter().filter(|e| e.0 == t).collect();
+                let same = writes.iter().all(|e| e.2.is_none() || e.2 == guard);
+                same && !lane_reaches(x.st, |b| b == block, |b| writes.iter().any(|e| e.1 == b))
+            })
+        })
+}
+
+/// Whether a lane can get from the entry to a block `to` accepts without
+/// passing a block `avoiding` accepts (per-lane branches).
+fn lane_reaches(
+    st: &Structured,
+    to: impl Fn(usize) -> bool,
+    avoiding: impl Fn(usize) -> bool,
+) -> bool {
+    let mut seen = vec![false; st.exits.len()];
+    let mut stack = vec![0];
+    while let Some(b) = stack.pop() {
+        if avoiding(b) || std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        if to(b) {
+            return true;
+        }
+        match st.exits[b] {
+            LaneExit::Jump(t) => stack.push(t),
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                if when != Bool::FALSE {
+                    stack.push(taken);
+                }
+                if when != Bool::TRUE {
+                    stack.push(not_taken);
+                }
+            }
+            LaneExit::End | LaneExit::Indirect => {}
+        }
+    }
+    false
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
@@ -492,7 +571,10 @@ impl<'a> Lower<'a> {
             HwStage::Ps => manual_rows(x.io, &halves, &mut s.inputs),
             _ => HashSet::new(),
         };
-        s.outputs = x.outputs.clone();
+        s.outputs = x
+            .linked
+            .as_ref()
+            .map_or_else(|| x.outputs.clone(), |l| l.outputs.clone());
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -553,7 +635,10 @@ impl<'a> Lower<'a> {
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
-            s.prims = x.prims.clone();
+            s.prims = x
+                .linked
+                .as_ref()
+                .map_or_else(|| x.prims.clone(), |l| l.prims.clone());
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -7736,6 +7821,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            linked: None,
         })
         .map(|_| ())
     }
