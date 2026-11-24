@@ -264,6 +264,7 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: a live adapter the factory just returned; GetDesc1 fills a value.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -273,6 +274,71 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    /// The host device is made with DRED's auto-breadcrumbs and page-fault
+    /// reporting on exactly when `VICTORY_D3D12_DRED` is set in a
+    /// diagnostics build: once removed, both outputs are there, and the
+    /// failure report carries the breadcrumbs. In a child process: a
+    /// process has one device per adapter, and removing it ends it for
+    /// every other test.
+    #[test]
+    fn device_removed_data_follows_the_switch() {
+        const CHILD: &str = "VICTORY_TEST_DRED_CHILD";
+        if let Some(dred) = std::env::var_os(CHILD) {
+            let Some(host) = host() else {
+                return; // no host GPU
+            };
+            let on = cfg!(feature = "diagnostics") && dred == "1";
+            assert_eq!(dred_on(), on);
+            let removed = host.device.cast::<ID3D12Device5>().unwrap();
+            let data = host.device.cast::<ID3D12DeviceRemovedExtendedData1>().unwrap();
+            // SAFETY: plain DXGI queries for the device's own adapter.
+            let adapter = unsafe {
+                let luid = host.device.GetAdapterLuid();
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                    .and_then(|a| a.GetDesc1())
+                    .map(|d| {
+                        String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_owned()
+                    })
+            };
+            // SAFETY: a live device, removed on purpose; plain queries.
+            let (crumbs, fault) = unsafe {
+                removed.RemoveDevice();
+                (
+                    data.GetAutoBreadcrumbsOutput1().map(|_| ()),
+                    data.GetPageFaultAllocationOutput1().map(|_| ()),
+                )
+            };
+            let report = host.removal_data(&[]);
+            println!(
+                "dred {on} on {adapter:?}: breadcrumbs {crumbs:?}, page faults {fault:?}, \
+                 report {report:?}"
+            );
+            assert_eq!(crumbs.is_ok(), on);
+            assert_eq!(fault.is_ok(), on);
+            assert_eq!(report.contains("; breadcrumbs (done/count, list)"), on);
+            return;
+        }
+        for dred in ["1", "0"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "host::tests::device_removed_data_follows_the_switch"])
+                .args(["--nocapture", "--test-threads=1"])
+                .env(CHILD, dred)
+                .env_remove("VICTORY_D3D12_WARP");
+            if dred == "1" {
+                child.env("VICTORY_D3D12_DRED", "1");
+            } else {
+                child.env_remove("VICTORY_D3D12_DRED");
+            }
+            let out = child.output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            eprintln!("{text}");
+            assert!(out.status.success(), "child with dred {dred}: {text}");
+            assert!(text.contains("1 passed"), "child with dred {dred} ran nothing: {text}");
+        }
     }
 }
 
@@ -307,6 +373,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Diagnostics: title objects (pipelines, heaps) the list's commands
+    /// name, checked for being alive at submission.
+    #[cfg(feature = "diagnostics")]
+    objects: Mutex<Vec<(usize, &'static str)>>,
+    /// Diagnostics: host heap slots draws read through tables (title heap,
+    /// index, record key), checked for being unchanged at submission.
+    #[cfg(feature = "diagnostics")]
+    slots: Mutex<Vec<(usize, u32, u64)>>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -447,6 +521,40 @@ impl Host {
         })
     }
 
+    /// Whether the host runs 64-bit atomics on typed views from the
+    /// descriptor heap (translated 64-bit image atomics need both
+    /// capabilities); logged once.
+    pub(crate) fn typed_atomics_64(&self) -> bool {
+        static ATOMICS: OnceLock<bool> = OnceLock::new();
+        *ATOMICS.get_or_init(|| {
+            let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+            let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+            // SAFETY: each query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS9,
+                        (&raw mut typed).cast(),
+                        size_of_val(&typed) as u32,
+                    )
+                    .is_ok()
+                    && self
+                        .device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS11,
+                            (&raw mut heap).cast(),
+                            size_of_val(&heap) as u32,
+                        )
+                        .is_ok()
+            };
+            let atomics = ok
+                && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+            tracing::info!(atomics, "host 64-bit typed atomics on heap views");
+            atomics
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -483,7 +591,36 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                objects: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                slots: Mutex::default(),
             })
+        }
+    }
+
+    /// Diagnostics: removes the device once `VICTORY_D3D12_REMOVE_AT`
+    /// frames are presented, just after the first submission from then on
+    /// whose lists noted commands (`runs`), so the failure report and what
+    /// the harness saves from it can be checked without a GPU fault.
+    #[cfg(feature = "diagnostics")]
+    fn remove_on_request(&self, runs: &[&HostList]) {
+        static AT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_D3D12_REMOVE_AT").ok()?.parse().ok()
+        });
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let noted = || {
+            runs.iter().any(|r| !r.notes.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
+        };
+        if AT.is_some_and(|n| crate::queue::presented() >= n)
+            && noted()
+            && !DONE.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!("removing the host device on request (VICTORY_D3D12_REMOVE_AT)");
+            if let Ok(d) = self.device.cast::<ID3D12Device5>() {
+                // SAFETY: a live device; removal is what is asked for.
+                unsafe { d.RemoveDevice() };
+            }
         }
     }
 
@@ -495,6 +632,10 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            list.check_alive();
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -528,6 +669,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // With the lists submitted, so DRED has them in flight.
+                #[cfg(feature = "diagnostics")]
+                self.remove_on_request(runs);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -678,6 +822,13 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
+                    // The ops it completed last, the last completed one
+                    // last (none: it never started).
+                    let ops: Vec<i32> = history[(done as usize).saturating_sub(16)..done as usize]
+                        .iter()
+                        .map(|op| op.0)
+                        .collect();
+                    text.push_str(&format!(", ops completed before it {ops:?}"));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
@@ -883,6 +1034,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.objects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1003,6 +1158,73 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    /// Diagnostics: notes a title object the list's commands name.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_object(&self, object: usize, kind: &'static str) {
+        self.objects.lock().unwrap_or_else(|e| e.into_inner()).push((object, kind));
+    }
+
+    /// Diagnostics: notes a host heap slot a draw reads through a table.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_slot(&self, heap: usize, index: u32, key: u64) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).push((heap, index, key));
+    }
+
+    /// Diagnostics: at submission, the title objects the list names (its
+    /// textures and what `note_object` noted) that the title has released
+    /// since they were recorded.
+    #[cfg(feature = "diagnostics")]
+    fn check_alive(&self) {
+        use std::sync::atomic::AtomicU64;
+        static DEAD: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let mut dead = [0u64; 3];
+        for &r in self.states.lock().unwrap_or_else(|e| e.into_inner()).keys() {
+            dead[0] += u64::from(!crate::object::alive(r));
+        }
+        for &(o, kind) in self.objects.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if !crate::object::alive(o) {
+                dead[if kind == "pipeline" { 1 } else { 2 }] += 1;
+            }
+        }
+        if dead.iter().any(|&d| d > 0) {
+            let totals: Vec<u64> = DEAD
+                .iter()
+                .zip(dead)
+                .map(|(t, d)| t.fetch_add(d, Ordering::Relaxed) + d)
+                .collect();
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 50 {
+                tracing::warn!(
+                    textures = dead[0],
+                    pipelines = dead[1],
+                    heaps = dead[2],
+                    ?totals,
+                    "LIFETIME: a submitted list names title objects released since recording"
+                );
+            }
+        }
+        let mut changed = 0u64;
+        for &(h, index, key) in self.slots.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if crate::object::alive(h)
+                && let Some(host) = crate::descriptor::heap(h as crate::object::This).host()
+                && host.made_key(index) != key
+            {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            static CHANGED: AtomicU64 = AtomicU64::new(0);
+            let total = CHANGED.fetch_add(changed, Ordering::Relaxed) + changed;
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 50 {
+                tracing::warn!(
+                    changed,
+                    total,
+                    "LIFETIME: host descriptor slots a submitted list reads were remade since recording"
+                );
+            }
         }
     }
 

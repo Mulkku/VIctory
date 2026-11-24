@@ -84,12 +84,28 @@ pub struct Descriptor {
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
+    /// Loads from the user-data spill table are in [`Resources::spills`]
+    /// instead.
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// Values holding root parameters: user SGPRs on entry and the dwords
+    /// loaded from the spill table; layout index, dword within the
+    /// parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads from the user-data spill table ([`SPILLED`]): what
+    /// they load is root parameters, listed in [`Resources::params`].
+    pub spills: Vec<Site>,
+    /// `v_readlane_b32` results that read back an SGPR value the code
+    /// spilled to a VGPR lane, with that value.
+    pub restored: Vec<(Value, Value)>,
 }
+
+/// The first user-data index a compute program finds in memory: it has 16
+/// user-data registers, and a root signature that needs more passes the
+/// rest in a table whose address is user data 0 and 1 (the high half
+/// masked to the address bits); dword k of the table is user-data index
+/// `SPILLED + k`, and the layout gives such parameters those indices.
+pub const SPILLED: u32 = 16;
 
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
@@ -97,14 +113,13 @@ pub struct Resources {
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage)?;
     let mut out = Resources {
-        params: p
-            .inputs
+        params: t
+            .user
             .iter()
-            .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
-                Some((v, param, dword))
-            })
+            .enumerate()
+            .filter_map(|(v, u)| u.map(|(param, dword)| (Value(v as u32), param, dword)))
             .collect(),
+        spills: t.spills.clone(),
         ..Resources::default()
     };
     for (b, block) in p.blocks.iter().enumerate() {
@@ -130,6 +145,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }
+                Fields::Smem { .. } if t.spills.contains(&site) => {}
                 Fields::Smem {
                     base,
                     offset,
@@ -149,6 +165,13 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
                     out.scalar.push((site, address));
+                }
+                Fields::Valu(_) => {
+                    if let (Some(Moved::Value(s)), Some(&(_, w))) =
+                        (t.restored(inst), inst.writes.first())
+                    {
+                        out.restored.push((w, s));
+                    }
                 }
                 _ => {}
             }
@@ -172,6 +195,17 @@ struct Sum {
     dynamic: Option<Value>,
 }
 
+/// What the high half of an address holds before any carry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum High {
+    /// 0 (a table: 32-bit heap addresses).
+    Zero,
+    /// This value (the high half of `s_getpc_b64`).
+    Value(Value),
+    /// Dword 1 of this root parameter (a root descriptor).
+    Param(usize),
+}
+
 struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
@@ -183,6 +217,10 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// The root parameter dword each value holds (layout index, dword).
+    user: Vec<Option<(usize, u32)>>,
+    /// Loads from the user-data spill table.
+    spills: Vec<Site>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -226,9 +264,72 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            user: vec![None; n],
+            spills: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
+        for &(reg, v) in &p.inputs {
+            t.user[v.0 as usize] = t.param_of(reg);
+        }
+        t.find_spills();
         Ok(t)
+    }
+
+    /// Finds the loads from a compute program's user-data spill table
+    /// ([`SPILLED`]) and the root parameter dwords they load.
+    fn find_spills(&mut self) {
+        let spilled = |p: &RootParam| u32::from(p.user_data) >= SPILLED;
+        if self.stage != HwStage::Cs || !self.layout.iter().any(spilled) {
+            return;
+        }
+        let input = |k: u8| {
+            let reg = Reg::S(self.stage.user_sgpr(k));
+            self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
+        };
+        let (Some(lo), Some(hi)) = (input(0), input(1)) else {
+            return;
+        };
+        let is_hi = |t: Term| {
+            t == Term::Value(hi)
+                || matches!(t, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                    |(_, [a, b])| a == Term::Value(hi) && matches!(b, Term::Const(_))
+                        || b == Term::Value(hi) && matches!(a, Term::Const(_))
+                ))
+        };
+        let (mut found, mut sites) = (Vec::new(), Vec::new());
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Smem {
+                    base: Operand::Scalar { code, .. },
+                    offset,
+                    soffset: Operand::Scalar { code: NULL, .. },
+                    ..
+                } = inst.fields
+                else {
+                    continue;
+                };
+                if !inst.name().starts_with("s_load_dword") || offset < 0 || offset % 4 != 0 {
+                    continue;
+                }
+                let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+                if word(0) != Some(Term::Value(lo)) || !word(1).is_some_and(is_hi) {
+                    continue;
+                }
+                for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    let index = SPILLED + offset as u32 / 4 + k as u32;
+                    let param = self.layout.iter().enumerate().find_map(|(n, p)| {
+                        let dword = index.checked_sub(p.user_data.into())?;
+                        (spilled(p) && dword < p.sgprs).then_some((n, dword))
+                    });
+                    found.push((v, param));
+                }
+                sites.push((b, i));
+            }
+        }
+        for (v, param) in found {
+            self.user[v.0 as usize] = param;
+        }
+        self.spills = sites;
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -353,15 +454,24 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+        if let Some((_, dword)) = self.user[v.0 as usize] {
+            return match dword {
+                0 => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
                 },
                 _ => dynamic,
             };
+        }
+        if self.inputs[v.0 as usize].is_some() {
+            return dynamic;
+        }
+        if let Some(t) = self.first_lane(v) {
+            // An address the code made uniform: lane 0's sum is every
+            // lane's.
+            let s = self.sum(t);
+            return if s.base.is_some() { s } else { dynamic };
         }
         if self.getpc(v).is_some() {
             return Sum {
@@ -393,6 +503,19 @@ impl<'a> Tracer<'a> {
         let inst = self.def(lo)?;
         (inst.name() == "s_getpc_b64" && inst.writes.first().is_some_and(|w| w.1 == lo))
             .then_some(inst)
+    }
+
+    /// The origin of the VGPR value a `v_readfirstlane_b32` writing `v`
+    /// reads.
+    fn first_lane(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "v_readfirstlane_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        self.vterm(inst, f.src.first()?)
     }
 
     /// The operands of a VALU addition (`v_add_co_u32`, `v_add_nc_u32`)
@@ -500,8 +623,10 @@ impl<'a> Tracer<'a> {
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
-            let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            let Some(high) = pc.writes.get(1).map(|w| High::Value(w.1)) else {
+                return Err("an address with an untracked high half");
+            };
+            if !self.high_half(hi, high) && !self.carried(hi, high) {
                 return Err("an address with an untracked high half");
             }
             return Ok(Address {
@@ -512,24 +637,18 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
-            .param_of(reg)
-            .ok_or("an address not from a root parameter")?;
+        let (param, _) =
+            self.user[base.0 as usize].ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
-            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => High::Zero,
+            RootType::Descriptor => High::Param(param),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
-            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
+            && !(dynamic.is_some() && high != High::Zero && self.carried(hi, high))
         {
             return Err("an address with an untracked high half");
         }
@@ -540,24 +659,39 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
-    fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
-        let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
+    /// Whether `t` is the high half `high` stands for.
+    fn is_high(&self, t: Term, high: High) -> bool {
+        match high {
+            High::Zero => t == Term::Const(0),
+            High::Value(h) => t == Term::Value(h),
+            High::Param(p) => {
+                matches!(t, Term::Value(v) if self.user[v.0 as usize] == Some((p, 1)))
+            }
+        }
+    }
+
+    /// `hi` is `high`, possibly plus a carry.
+    fn high_half(&self, hi: Term, high: High) -> bool {
+        self.is_high(hi, high)
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+                |(_, [a, b])| self.is_high(a, high) && b == Term::Const(0)
+                    || self.is_high(b, high) && a == Term::Const(0)
             ))
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
-    fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = hi else { return false };
-        if v == high {
+    /// `v_add_co_ci_u32` with `high` as an operand, possibly made uniform
+    /// by `v_readfirstlane_b32`.
+    fn carried(&self, hi: Term, high: High) -> bool {
+        if self.is_high(hi, high) {
             return true;
         }
+        let Term::Value(v) = hi else { return false };
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
+        }
+        if let Some(t) = self.first_lane(v) {
+            return self.carried(t, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -723,9 +857,35 @@ impl<'a> Tracer<'a> {
                     .collect();
                 self.classify(&edge, joins)
             })
-            .collect::<Result<_, _>>();
+            .collect::<Result<Vec<_>, _>>();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        let args = args?;
+        // The same descriptor loaded again on each path (same address, no
+        // computed term): one load stands for all.
+        let address = |s: &Source| match *s {
+            Source::Loaded { load, first } => {
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } = &self.inst(load).fields
+                else {
+                    return None;
+                };
+                let a = self
+                    .smem_address(self.inst(load), base, *offset, soffset)
+                    .ok()?;
+                a.dynamic.is_none().then_some((a, first))
+            }
+            _ => None,
+        };
+        if let Some(first) = args.first().and_then(address)
+            && args.iter().all(|s| address(s) == Some(first))
+        {
+            return Ok(args.into_iter().next());
+        }
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// `v` as some other dword with constant bits set.
@@ -1056,6 +1216,74 @@ mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+        // The lane read gives back the table address itself.
+        let table = r.params.iter().find(|p| p.1 == 0).unwrap().0;
+        assert_eq!(r.restored.len(), 1);
+        assert_eq!(r.restored[0].1, table);
+    }
+
+    #[test]
+    fn compute_root_parameters_past_16_come_from_the_spill_table() {
+        let r = track_words(
+            &[
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, 0xff
+                0xF408_0201,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+                0xF400_0301,
+                0xFA00_0008, // s_load_dword s12, s[2:3], 0x8
+                0xBE8A_03C1, // s_mov_b32 s10, -1
+                0xBE8B_03FF,
+                0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+                0xF420_0104,
+                0xFA00_0000, // s_buffer_load_dword s4, s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 16, 2), param(Constants, 18, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.spills, [(0, 2), (0, 3)]);
+        assert!(r.scalar.is_empty(), "{:?}", r.scalar);
+        let mut params: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
+        params.sort_unstable();
+        // Dwords 16-19 (the root descriptor, the constant, a dword no
+        // parameter has) and dword 18 again.
+        assert_eq!(params, [(0, 0), (0, 1), (1, 0), (1, 0)]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+    }
+
+    #[test]
+    fn code_tables_are_followed_through_readfirstlane() {
+        let r = track_words(
+            &[
+                0xBE80_1F80, // s_getpc_b64 s[0:1]
+                0x8000_FF00,
+                0x0000_0100, // s_add_u32 s0, s0, 0x100
+                0x8201_8001, // s_addc_u32 s1, s1, 0
+                0x4A02_0000, // v_add_nc_u32 v1, s0, v0
+                0x7E04_0201, // v_mov_b32 v2, s1
+                0x7E04_0501, // v_readfirstlane_b32 s2, v1
+                0x7E06_0502, // v_readfirstlane_b32 s3, v2
+                0xF400_0101,
+                0xFA00_0000, // s_load_dword s4, s[2:3], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset), (CODE, 0x104));
+        assert!(a.dynamic.is_some());
     }
 
     #[test]
@@ -1095,6 +1323,33 @@ mod tests {
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn one_descriptor_loaded_on_both_paths_is_one_source() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0003, // s_cbranch_scc1 -> 0x1c
+                0xF408_0001,
+                0xFA00_0010, // s_load_dwordx4 s[0:3], s[2:3], 0x10
+                0xBF82_0002, // s_branch -> 0x24
+                0xF408_0001,
+                0xFA00_0010, // 0x1c: s_load_dwordx4 s[0:3], s[2:3], 0x10
+                0xF420_0100,
+                0xFA00_0000, // 0x24: s_buffer_load_dword s4, s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Loaded { load, first: 0 } = r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!(a, at(0, 0x10));
     }
 
     #[test]

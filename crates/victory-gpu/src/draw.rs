@@ -8,11 +8,14 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DeclaredView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::{Atomic64, Atomic64View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -129,18 +132,34 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a root view is on the host.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootView {
+    Constant,
+    Shader,
+    Unordered,
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
+/// copy in upload memory. What an unordered view's shaders write goes
+/// back to title memory after the submission.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = shadow.left(address).min(if kind == RootView::Constant {
+        1 << 16
+    } else {
+        1 << 20
+    });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if kind == RootView::Unordered {
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        return Some(gpu);
+    }
+    if kind == RootView::Shader || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -344,7 +363,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -398,12 +419,11 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. False if the draw or dispatch must not
+    /// run (a view 64-bit atomics cannot use).
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -420,6 +440,10 @@ impl State {
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
+            #[cfg(feature = "diagnostics")]
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                list.note_object(h, "heap");
+            }
         }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -443,10 +467,15 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+            #[cfg(feature = "diagnostics")]
+            list.note_object(self.pipeline, "pipeline");
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.views, compute);
+            if !self.atomic64_views(list, t, &made, compute) {
+                return false;
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -467,28 +496,47 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootView::Constant),
+                (&stage.root_srvs, RootView::Shader),
+                (&stage.root_uavs, RootView::Unordered),
+            ] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, RootView::Constant) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu);
+                            }
+                            (false, RootView::Shader) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                            (false, RootView::Unordered) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                            (true, RootView::Constant) => {
+                                l.SetComputeRootConstantBufferView(param, gpu);
+                            }
+                            (true, RootView::Shader) => {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            }
+                            (true, RootView::Unordered) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            }
                         }
                     }
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -513,7 +561,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -546,7 +596,8 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            let roots = stage.root_cbvs.iter().chain(&stage.root_srvs);
+            for &(slot, _) in roots.chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -602,22 +653,138 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            list.note_slot(
+                std::ptr::from_ref(heap) as usize,
+                index,
+                host.made_key(index),
+            );
             readable(list, u, &view);
         }
+    }
+
+    /// Makes the views a shader uses with 64-bit atomics integer views (see
+    /// [`Atomic64`]), after [`State::tables`] made their slots (`made`:
+    /// its tables made afresh); false if one cannot be.
+    fn atomic64_views(
+        &self,
+        list: &HostList,
+        t: &crate::pipeline::Translated,
+        made: &[(u8, u32)],
+        compute: bool,
+    ) -> bool {
+        for &(slot, dword) in &t.host.atomic64_views {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                once!(slot, "a 64-bit atomic view in a table the title did not set; draw skipped");
+                return false;
+            };
+            let handle = table + u64::from(dword) * 4;
+            let declared = t
+                .host
+                .views
+                .iter()
+                .find(|d| d.slot == Some(slot) && d.index == dword / 8);
+            let found = match made.iter().find(|m| m.0 == slot) {
+                // A table made afresh in dynamic slots, as far as its
+                // used-resource entries and declared views go.
+                Some(&(_, offset)) => {
+                    let view = crate::descriptor::view(handle);
+                    // A view of another kind than declared is a null view
+                    // of the declared kind there (`tables`): nothing to
+                    // remake, the atomics see zeros.
+                    if declared
+                        .is_some_and(|d| !crate::descriptor::host::declares(view.as_ref(), d))
+                    {
+                        continue;
+                    }
+                    (declared.is_some()
+                        || t.used
+                            .iter()
+                            .any(|u| u.slot == slot && u.table_offset_dwords / 8 >= dword / 8))
+                    .then(|| self.heap_of(table))
+                    .flatten()
+                    .and_then(|heap| Some((heap.host()?, offset / 32 + dword / 8, view?)))
+                }
+                None => self.heap_of(handle).and_then(|heap| {
+                    let (host, index) = (heap.host()?, heap.index(handle)?);
+                    Some((host, index, host.mirror(index, handle, true)?))
+                }),
+            };
+            let Some((host, index, view)) = found else {
+                once!(slot, "a 64-bit atomic view without a view; draw skipped");
+                return false;
+            };
+            let checked = host.atomic64_at(index, &view);
+            // Each kind of view once (refused ones are what the title loses,
+            // the others what it binds), and the count of each outcome at
+            // powers of two.
+            static SEEN: Mutex<Vec<Atomic64View>> = Mutex::new(Vec::new());
+            static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+            let (resource, format, outcome) = (checked.resource, checked.view, checked.outcome);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&checked) {
+                seen.push(checked);
+                #[cfg(feature = "diagnostics")]
+                let described = describe(Some(&view));
+                #[cfg(not(feature = "diagnostics"))]
+                let described = "";
+                if outcome == Atomic64::Refused {
+                    tracing::warn!(
+                        resource,
+                        view = format,
+                        compute,
+                        %described,
+                        "64-bit atomic view of another format; draw skipped"
+                    );
+                } else {
+                    tracing::info!(
+                        resource,
+                        view = format,
+                        ?outcome,
+                        compute,
+                        %described,
+                        "64-bit atomic view"
+                    );
+                }
+            }
+            drop(seen);
+            let n = COUNTS[outcome as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(?outcome, n, "64-bit atomic views so far");
+            }
+            if outcome == Atomic64::Refused {
+                return false;
+            }
+            if let View::Unordered(resource, _, _) = view {
+                const UNORDERED_ACCESS: u32 = 0x8;
+                crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            }
+        }
+        true
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. So are tables holding a view of another dimension
+    /// (or access) than the shader declares there (`views`), with a null
+    /// view of the declared kind in its place: the console reads any null
+    /// descriptor as zeros, the host's views must match. Returns those
+    /// tables' new byte offsets by root parameter; the other tables' slots
+    /// are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        views: &[DeclaredView],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -646,6 +813,34 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        for d in views {
+            let Some(slot) = d.slot else {
+                // Directly indexed: no table to make afresh.
+                if let Some(heap) =
+                    (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))
+                    && !crate::descriptor::host::declares(
+                        crate::descriptor::view(heap.start + u64::from(d.index) * 32).as_ref(),
+                        d,
+                    )
+                {
+                    once!(
+                        index = d.index,
+                        "a heap view of another kind than the shader declares"
+                    );
+                }
+                continue;
+            };
+            if fresh.contains(&slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let view = crate::descriptor::view(table + u64::from(d.index) * 32);
+            if !crate::descriptor::host::declares(view.as_ref(), d) {
+                fresh.push(slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -669,12 +864,16 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            let declared: Vec<&DeclaredView> =
+                views.iter().filter(|d| d.slot == Some(slot)).collect();
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(declared.iter().map(|d| d.index + 1))
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // The table, what its entries hold (record words) and the views
+            // the shader declares in it.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -683,6 +882,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
+                declared.hash(&mut h);
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
@@ -706,8 +906,19 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                let wanted = declared.iter().find(|d| d.index == k);
+                if let Some(d) = wanted
+                    && !crate::descriptor::host::declares(view.as_ref(), d)
+                {
+                    host.make_declared_null(index, d);
+                    substituted(d, view.as_ref());
+                    continue;
+                }
+                match view {
+                    // A constant buffer view, but where the shader declares a
+                    // view (reads it raw): then the heap's raw view of it.
+                    Some(View::Constant(address, size)) if wanted.is_none() => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -1069,6 +1280,41 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+/// Views replaced by a null view of the kind the shader declares, so far.
+static SUBSTITUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a view replaced by a null view of the declared kind; each pair of
+/// declared and found kind logged once.
+fn substituted(declared: &DeclaredView, view: Option<&View>) {
+    let n = SUBSTITUTED.fetch_add(1, Ordering::Relaxed) + 1;
+    static SEEN: std::sync::Mutex<Vec<(DeclaredView, String)>> = std::sync::Mutex::new(Vec::new());
+    let found = match view {
+        None => "no view".to_owned(),
+        Some(View::Shader(_, Some(d))) => format!("shader view, dimension {}", d[1]),
+        Some(View::Unordered(_, _, Some(d))) => format!("unordered view, dimension {}", d[1]),
+        Some(v) => format!("{v:?}").chars().take(24).collect(),
+    };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (
+        DeclaredView {
+            index: 0,
+            slot: None,
+            ..*declared
+        },
+        found,
+    );
+    if !seen.contains(&key) {
+        tracing::warn!(
+            declared = ?key.0.kind,
+            uav = declared.uav,
+            found = key.1,
+            total = n,
+            "a view of another kind than the shader declares made a null view of that kind"
+        );
+        seen.push(key);
+    }
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
@@ -1078,9 +1324,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {

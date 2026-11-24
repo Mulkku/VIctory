@@ -10,7 +10,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::OnceLock;
 
 use crate::object::{
-    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid,
+    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid, slot,
 };
 use crate::resource::PAGEABLE_IIDS;
 
@@ -108,14 +108,16 @@ pub extern "system" fn serialize(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
+    let hr = unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
             version,
             blob,
             error,
         )
-    }
+    };
+    log_rejection(hr, error);
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -138,7 +140,34 @@ pub extern "system" fn serialize_versioned(
         ..desc
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    log_rejection(hr, error);
+    hr
+}
+
+/// The host's serializer failed: say so with its message, since a title
+/// rarely reports it and its pipelines then go missing without a trace.
+fn log_rejection(hr: HRESULT, error: *mut *mut c_void) {
+    if hr >= 0 {
+        return;
+    }
+    // SAFETY: the title's out pointer (null is tolerated); the host fills it.
+    let blob = unsafe { error.as_ref() }.map_or(std::ptr::null_mut(), |&blob| blob);
+    let message = if blob.is_null() {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        let blob = blob.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        // SAFETY: the host's error blob holds `size` bytes of text.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(data, size) })
+    };
+    tracing::warn!(
+        hr = format_args!("{:#x}", hr),
+        message = message.trim_end_matches(['\0', '\n']),
+        "host rejected root signature"
+    );
 }
 
 type Deserialize =
@@ -215,27 +244,59 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::S_OK;
 
-    /// One 32-bit constant at b0, serialized by the host, then created.
+    /// The host deserializer's interface id, in our layout.
+    #[cfg(windows)]
+    fn deserializer_iid() -> Iid {
+        use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
+        use windows::core::Interface;
+        let iid: Iid = ID3D12RootSignatureDeserializer::IID.to_u128().to_be_bytes();
+        guid(
+            u32::from_be_bytes(iid[0..4].try_into().unwrap()),
+            u16::from_be_bytes(iid[4..6].try_into().unwrap()),
+            u16::from_be_bytes(iid[6..8].try_into().unwrap()),
+            iid[8..16].try_into().unwrap(),
+        )
+    }
+
+    /// `count` 32-bit constants, laid out as the title's (and the host's)
+    /// `D3D12_ROOT_PARAMETER`: 32 bytes, the union at 8, the visibility at 24.
+    #[cfg(windows)]
+    fn constants(
+        register: u32,
+        space: u32,
+        count: u32,
+        visibility: i32,
+    ) -> windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY,
+        };
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: register,
+                    RegisterSpace: space,
+                    Num32BitValues: count,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY(visibility),
+        }
+    }
+
+    /// Constants at b3 in space 2 for the pixel stage, with a console flag:
+    /// serialized by the host, created, and read back field for field.
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
-            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_PIXEL,
+            ID3D12RootSignatureDeserializer,
         };
-        let parameter = D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS {
-                    ShaderRegister: 0,
-                    RegisterSpace: 0,
-                    Num32BitValues: 1,
-                },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        };
+        use windows::core::Interface;
+        let parameter = constants(3, 2, 4, D3D12_SHADER_VISIBILITY_PIXEL.0);
         let desc = Desc {
             parameter_count: 1,
             parameters: (&raw const parameter).cast(),
@@ -256,7 +317,60 @@ mod tests {
             S_OK
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            create_deserializer(data, size, &deserializer_iid(), &mut out),
+            S_OK
+        );
+        // SAFETY: the host handed out this interface.
+        let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
+        // SAFETY: valid while the deserializer lives.
+        let read = unsafe { &*deserializer.GetRootSignatureDesc() };
+        assert_eq!((read.NumParameters, read.Flags.0), (1, 1));
+        // SAFETY: one parameter, as just checked.
+        let read = unsafe { &*read.pParameters };
+        // SAFETY: a constants parameter, as checked first.
+        let values = unsafe { read.Anonymous.Constants };
+        assert_eq!(
+            (
+                read.ParameterType,
+                values.ShaderRegister,
+                values.RegisterSpace,
+                values.Num32BitValues,
+                read.ShaderVisibility,
+            ),
+            (
+                D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                3,
+                2,
+                4,
+                D3D12_SHADER_VISIBILITY_PIXEL
+            )
+        );
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+    }
+
+    /// A visibility the host does not know fails the same on every machine,
+    /// with the host's message (this test once read its visibility from past
+    /// the end of a 20-byte parameter, so it passed or failed with the stack).
+    #[cfg(windows)]
+    #[test]
+    fn host_rejects_unknown_visibilities() {
+        let parameter = constants(0, 0, 1, 0x7fff_0000);
+        let desc = Desc {
+            parameter_count: 1,
+            parameters: (&raw const parameter).cast(),
+            sampler_count: 0,
+            samplers: std::ptr::null(),
+            flags: 0,
+        };
+        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(serialize(&desc, 1, &mut blob, &mut error), E_INVALIDARG);
+        assert!(blob.is_null());
+        assert!(!error.is_null());
+        let error = error.cast_const().cast::<Object>();
+        assert!(slot::<extern "system" fn(This) -> usize>(error, 0x20)(error) > 0);
+        slot::<extern "system" fn(This) -> u32>(error, 0x10)(error);
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).
@@ -280,15 +394,11 @@ mod tests {
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
-        let iid: Iid = ID3D12RootSignatureDeserializer::IID.to_u128().to_be_bytes();
-        let iid = guid(
-            u32::from_be_bytes(iid[0..4].try_into().unwrap()),
-            u16::from_be_bytes(iid[4..6].try_into().unwrap()),
-            u16::from_be_bytes(iid[6..8].try_into().unwrap()),
-            iid[8..16].try_into().unwrap(),
-        );
         let mut out = std::ptr::null_mut();
-        assert_eq!(create_deserializer(data, size, &iid, &mut out), S_OK);
+        assert_eq!(
+            create_deserializer(data, size, &deserializer_iid(), &mut out),
+            S_OK
+        );
         // SAFETY: the host handed out this interface.
         let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
         // SAFETY: valid while the deserializer lives.

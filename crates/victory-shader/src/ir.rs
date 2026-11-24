@@ -14,6 +14,13 @@
 //! M0-relative VGPR access (`v_movrels/d/sd_b32`, `v_swaprel_b32`) names its
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
+//!
+//! One rewrite: SGPRs the compiler spills to VGPR lanes (`v_writelane_b32`)
+//! and restores (`v_readlane_b32` of the same constant lane) are forwarded,
+//! so a read of the restored dword names the spilled value itself (see
+//! [`spill_traffic`] for the instructions left moving them).
+
+use std::collections::HashSet;
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
@@ -262,6 +269,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    if forward_spills(&mut blocks, values) {
+        remove_trivial_phis(&mut blocks, values);
+    }
     Ok(Program {
         wave64,
         vgprs,
@@ -634,6 +644,232 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
             }
         }
     }
+}
+
+/// Where a value is defined, by block and index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Def {
+    Inst(usize, usize),
+    Phi(usize, usize),
+}
+
+fn definitions(blocks: &[Block], values: u32) -> Vec<Option<Def>> {
+    let mut defs = vec![None; values as usize];
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            defs[phi.value.0 as usize] = Some(Def::Phi(b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, w) in &inst.writes {
+                defs[w.0 as usize] = Some(Def::Inst(b, i));
+            }
+        }
+    }
+    defs
+}
+
+/// SGPR spills through VGPR lanes: a `v_readlane_b32` of a constant lane
+/// restores the SGPR value `v_writelane_b32` put into that lane (on every
+/// path to it), and whatever reads the restored dword reads the spilled
+/// value itself. Both instructions ignore EXEC, so this holds whichever
+/// lanes run. Lane masks keep their meaning across a spill this way, and the
+/// spill itself needs no cross-lane code ([`spill_traffic`]). Returns
+/// whether anything was forwarded.
+fn forward_spills(blocks: &mut [Block], values: u32) -> bool {
+    let defs = definitions(blocks, values);
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    let find = |replaced: &[Value], mut v: Value| {
+        while replaced[v.0 as usize] != v {
+            v = replaced[v.0 as usize];
+        }
+        v
+    };
+    let mut any = false;
+    for block in blocks.iter() {
+        for inst in &block.insts {
+            if let Some((w, x)) = restored(blocks, &defs, inst)
+                && find(&replaced, x) != w
+            {
+                replaced[w.0 as usize] = x;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return false;
+    }
+    for block in blocks {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = find(&replaced, *a);
+            }
+        }
+        for inst in &mut block.insts {
+            for (_, v) in &mut inst.reads {
+                *v = find(&replaced, *v);
+            }
+        }
+    }
+    true
+}
+
+/// For `v_readlane_b32` of a constant lane restoring a spilled SGPR: the
+/// value it writes and the SGPR value spilled.
+fn restored(blocks: &[Block], defs: &[Option<Def>], inst: &Inst) -> Option<(Value, Value)> {
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
+        (v.dst, &v.src[..])
+    else {
+        return None;
+    };
+    let w = inst.write(Reg::S(code))?;
+    let x = spilled(
+        blocks,
+        defs,
+        inst.read(Reg::V(*reg))?,
+        lane_of(*lane)?,
+        &mut Vec::new(),
+    );
+    Some((w, x.ok()??))
+}
+
+/// The SGPR value lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi
+/// in `seen` (already being resolved), `Err` if it is no spilled SGPR.
+fn spilled(
+    blocks: &[Block],
+    defs: &[Option<Def>],
+    v: Value,
+    lane: u32,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Value>, ()> {
+    match defs[v.0 as usize].ok_or(())? {
+        Def::Phi(b, i) => {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &blocks[b].phis[i].args {
+                if let Some(x) = spilled(blocks, defs, a, lane, seen)? {
+                    if found.is_some_and(|f| f != x) {
+                        return Err(());
+                    }
+                    found = Some(x);
+                }
+            }
+            Ok(found)
+        }
+        Def::Inst(b, i) => {
+            let inst = &blocks[b].insts[i];
+            let Fields::Valu(w) = &inst.fields else {
+                return Err(());
+            };
+            let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+                return Err(());
+            };
+            if inst.name() != "v_writelane_b32" {
+                return Err(());
+            }
+            if lane_of(*at).ok_or(())? != lane {
+                return spilled(blocks, defs, inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+            }
+            match *value {
+                Operand::Scalar { code, .. } if code != gfx10::NULL => {
+                    inst.read(Reg::S(code)).map(Some).ok_or(())
+                }
+                _ => Err(()),
+            }
+        }
+    }
+}
+
+/// A lane select given as a constant.
+fn lane_of(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// The instructions left moving SGPRs through VGPR lanes once spills are
+/// forwarded, by block and index: `v_writelane_b32` whose result only such
+/// instructions read (directly or through VGPR phis), and `v_readlane_b32`
+/// of a constant lane whose result nothing else reads. Leaving them out
+/// changes nothing a program computes.
+pub fn spill_traffic(p: &Program) -> HashSet<(usize, usize)> {
+    let values = p
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.phis
+                .iter()
+                .map(|phi| phi.value)
+                .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+        })
+        .chain(p.inputs.iter().map(|i| i.1))
+        .map(|v| v.0 + 1)
+        .max()
+        .unwrap_or(0);
+    let defs = definitions(&p.blocks, values);
+    let mut readers: Vec<Vec<Def>> = vec![Vec::new(); values as usize];
+    let mut set = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            for a in &phi.args {
+                readers[a.0 as usize].push(Def::Phi(b, i));
+            }
+            if matches!(phi.reg, Reg::V(_)) {
+                set.insert(Def::Phi(b, i));
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, r) in &inst.reads {
+                readers[r.0 as usize].push(Def::Inst(b, i));
+            }
+            let lane = match &inst.fields {
+                Fields::Valu(v) => v.src.get(1).copied().and_then(lane_of),
+                _ => None,
+            };
+            if matches!(inst.name(), "v_writelane_b32" | "v_readlane_b32") && lane.is_some() {
+                set.insert(Def::Inst(b, i));
+            }
+        }
+    }
+    let (written, read) = (
+        |d: Def| -> Vec<Value> {
+            match d {
+                Def::Phi(b, i) => vec![p.blocks[b].phis[i].value],
+                Def::Inst(b, i) => p.blocks[b].insts[i].writes.iter().map(|w| w.1).collect(),
+            }
+        },
+        |d: Def| -> Vec<Value> {
+            match d {
+                Def::Phi(b, i) => p.blocks[b].phis[i].args.clone(),
+                Def::Inst(b, i) => p.blocks[b].insts[i].reads.iter().map(|r| r.1).collect(),
+            }
+        },
+    );
+    let mut work: Vec<Def> = set.iter().copied().collect();
+    while let Some(d) = work.pop() {
+        let outside = |w: &Value| readers[w.0 as usize].iter().any(|r| !set.contains(r));
+        if set.contains(&d) && written(d).iter().any(outside) {
+            set.remove(&d);
+            // What it reads may now have a reader outside the set.
+            work.extend(read(d).into_iter().filter_map(|r| defs[r.0 as usize]));
+        }
+    }
+    set.into_iter()
+        .filter_map(|d| match d {
+            Def::Inst(b, i) => Some((b, i)),
+            Def::Phi(..) => None,
+        })
+        .collect()
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
@@ -1223,5 +1459,65 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn spilled_masks_are_forwarded() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xD761_0001,
+                0x0001_006A, // v_writelane_b32 v1, vcc_lo, 0
+                0xD761_0001,
+                0x0001_026B, // v_writelane_b32 v1, vcc_hi, 1
+                0xBEEA_0480, // s_mov_b64 vcc, 0
+                0xD760_0002,
+                0x0001_0101, // v_readlane_b32 s2, v1, 0
+                0xD760_0003,
+                0x0001_0301, // v_readlane_b32 s3, v1, 1
+                0xD501_0002,
+                0x0009_0280, // v_cndmask_b32 v2, 0, 1, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let i = &p.blocks[0].insts;
+        let (cmp, select) = (&i[0], &i[6]);
+        assert_eq!(select.name(), "v_cndmask_b32");
+        // The select reads the compare's mask, not what the spill restored.
+        assert_eq!(select.read(Reg::S(2)), cmp.write(Reg::S(VCC)));
+        assert_eq!(select.read(Reg::S(3)), cmp.write(Reg::S(VCC + 1)));
+        assert_eq!(
+            spill_traffic(&p),
+            HashSet::from([(0, 1), (0, 2), (0, 4), (0, 5)])
+        );
+    }
+
+    #[test]
+    fn spills_differing_by_path_stay_lane_reads() {
+        for (other, forwarded) in [(4, true), (5, false)] {
+            let p = build_words(
+                &[
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0003, // s_cbranch_scc1 -> 20
+                    0xD761_0001,
+                    0x0001_0004, // v_writelane_b32 v1, s4, 0
+                    0xBF82_0002, // s_branch -> 28
+                    0xD761_0001,
+                    0x0001_0000 | other, // 20: v_writelane_b32 v1, s<other>, 0
+                    0xD760_0002,
+                    0x0001_0101, // 28: v_readlane_b32 s2, v1, 0
+                    0xBE83_0302, // s_mov_b32 s3, s2
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let join = p.blocks.iter().find(|b| b.offset == 28).unwrap();
+            let (restore, mov) = (&join.insts[0], &join.insts[1]);
+            let s4 = input(&p, Reg::S(4));
+            assert_eq!(mov.read(Reg::S(2)) == Some(s4), forwarded);
+            assert_eq!(mov.read(Reg::S(2)) == restore.write(Reg::S(2)), !forwarded);
+            assert_eq!(spill_traffic(&p).len(), if forwarded { 3 } else { 0 });
+        }
     }
 }

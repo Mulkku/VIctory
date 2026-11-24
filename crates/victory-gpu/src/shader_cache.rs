@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DeclaredView, HostShader, StaticSampler, UserData, ViewKind};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -166,6 +166,29 @@ fn root_type(code: u32) -> RootType {
         x => RootType::Other(x - 6),
     }
 }
+
+/// A declared view's kind as two words.
+fn kind_code(k: ViewKind) -> [u32; 2] {
+    match k {
+        ViewKind::Texture(d) => [0, u32::from(d)],
+        ViewKind::Typed => [1, 0],
+        ViewKind::Raw => [2, 0],
+        ViewKind::Structured(stride) => [3, stride],
+    }
+}
+
+fn view_kind([code, arg]: [u32; 2]) -> Option<ViewKind> {
+    Some(match code {
+        0 => ViewKind::Texture(u8::try_from(arg).ok()?),
+        1 => ViewKind::Typed,
+        2 => ViewKind::Raw,
+        3 => ViewKind::Structured(arg),
+        _ => return None,
+    })
+}
+
+/// [`DeclaredView::slot`] of the resource heap.
+const HEAP_SLOT: u32 = u32::MAX;
 
 /// Little-endian words and length-prefixed lists.
 fn encode(s: &HostShader) -> Vec<u8> {
@@ -206,9 +229,22 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, s.atomic64_views.len() as u32);
+    for &(slot, dword) in &s.atomic64_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
+    word(&mut out, s.views.len() as u32);
+    for v in &s.views {
+        let [code, arg] = kind_code(v.kind);
+        let slot = v.slot.map_or(HEAP_SLOT, u32::from);
+        for w in [slot, v.index, code, arg, u32::from(v.uav)] {
+            word(&mut out, w);
+        }
     }
     out
 }
@@ -266,6 +302,33 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut atomic64_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        atomic64_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
+    let n = r.word()? as usize;
+    let mut views = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let slot = match r.word()? {
+            HEAP_SLOT => None,
+            s => Some(u8::try_from(s).ok()?),
+        };
+        let index = r.word()?;
+        let kind = view_kind([r.word()?, r.word()?])?;
+        let uav = match r.word()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        views.push(DeclaredView {
+            slot,
+            index,
+            kind,
+            uav,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +337,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
+        atomic64_views,
+        views,
     })
 }
 
@@ -300,6 +366,22 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            root_uavs: vec![4],
+            atomic64_views: vec![(1, 16)],
+            views: vec![
+                DeclaredView {
+                    slot: Some(2),
+                    index: 5,
+                    kind: ViewKind::Structured(16),
+                    uav: true,
+                },
+                DeclaredView {
+                    slot: None,
+                    index: 70,
+                    kind: ViewKind::Texture(5),
+                    uav: false,
+                },
+            ],
         }
     }
 
@@ -324,7 +406,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

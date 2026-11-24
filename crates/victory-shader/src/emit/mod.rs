@@ -2,7 +2,12 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it: an RX 9070 XT
+//! reports 32 to 64 lanes, WARP 4 only (`WaveLaneCountMin`/`Max`, checked
+//! 2026-11-24), so WARP refuses those pipelines. SGPR spills through VGPR
+//! lanes need no lane layout ([`crate::ir::spill_traffic`]). Pixel and
+//! vertex code keeps to wave operations whose result holds on any wave
+//! size (see `lower::MaskData`), WARP's included.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -25,10 +30,19 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs, root SRVs and root UAVs** (raw buffers) as root
+//!   descriptors `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the
+//!   title's root parameter index ([`HostShader::root_cbvs`],
+//!   [`HostShader::root_srvs`], [`HostShader::root_uavs`]); the address
+//!   the title sets is the buffer's. What shaders write through a root UAV
+//!   goes back to title memory after the submission, as for UAVs in the
+//!   heap.
+//! * **Spilled root parameters** (added 2026-11-24): a compute root
+//!   signature larger than the 16 user-data registers passes the rest in
+//!   memory ([`crate::resource::SPILLED`]); the translation reads those
+//!   parameters as user data like the others (constants and table offsets
+//!   at their user-data index, root descriptors as the root views above),
+//!   so the host binds them the same way.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -40,9 +54,13 @@
 //!   and the attribute offset are the shader's own arithmetic on data in
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
-//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics,
+//!   typed-format loads without an index, and scalar loads
+//!   (`s_buffer_load_dword*`) of a descriptor the used-resource list does
+//!   not name a constant buffer (heap-indexed ones included: such a
+//!   descriptor is the title's shader or unordered view); structured with
+//!   the used-resource entry's stride when indexed; typed with four 32-bit
+//!   float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
@@ -52,8 +70,21 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. Global loads
+//!   from a root SRV read it raw.
+//! * **64-bit texture atomics** (added 2026-11-24; visibility-buffer and
+//!   depth min/max writes, two dwords per value): SM 6.6 64-bit typed
+//!   atomics on a heap resource. The host's view at that index must be an
+//!   R32G32 integer view (`R32G32_UINT` or `_SINT`), and the
+//!   device must report `AtomicInt64OnTypedResourceSupported` (options 9)
+//!   and `AtomicInt64OnDescriptorHeapResourceSupported` (options 11); a
+//!   device without them refuses the pipeline. No 32-bit emulation exists:
+//!   a 64-bit max or compare-exchange cannot be built from 32-bit ones.
+//! * **Barycentrics read as data** (added 2026-11-24): the console's i and
+//!   j of a pixel are the weights of vertices 1 and 2; read other than by
+//!   interpolation, they become `SV_Barycentrics` channels y and z (one
+//!   input per interpolation mode, two at most), which needs
+//!   `BarycentricsSupported` (options 3). Interpolation alone declares none.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -74,6 +105,18 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Linked to a pixel shader** ([`translate_linked`], added
+//!   2026-11-24): a vertex or mesh shader then declares its outputs in the
+//!   translated pixel shader's input layout: each output the pixel shader
+//!   reads (same semantic name and index) at the input's row, columns,
+//!   type and interpolation mode; system values it does not read on rows
+//!   past those; inputs nothing writes declared unwritten; other outputs
+//!   left out, with the stores to them. The console links stages by
+//!   semantic, and its vertex and pixel signatures place them at
+//!   different registers, which PC linking refuses
+//!   ([`link_mismatches`]). It also keeps mesh shaders under the
+//!   validator's [`MESH_OUTPUT_LIMIT`] ([`HostShader::mesh_output_bytes`]):
+//!   some console mesh programs declare more than any pixel shader reads.
 
 mod bitcode;
 mod container;
@@ -84,6 +127,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -154,6 +199,17 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
+    /// Texture views the shader uses with 64-bit atomics: (root parameter
+    /// index of a table, dword in the table). The host's view there must
+    /// be `R32G32_UINT` or `_SINT`; bind nothing else.
+    pub atomic64_views: Vec<(u8, u32)>,
+    /// The views the shader reads at fixed table or heap positions, with
+    /// the kind it declares for each: the host's view there must be of
+    /// that kind (a view of another dimension is invalid).
+    pub views: Vec<DeclaredView>,
 }
 
 impl HostShader {
@@ -168,6 +224,241 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// A mesh shader's vertex plus primitive output bytes as the validator
+    /// counts them: every declared component, 4 bytes, for each of the
+    /// maximum vertices or primitives rounded up to 32. 0 for other stages.
+    pub fn mesh_output_bytes(&self) -> u32 {
+        if self.stage != HwStage::Ms {
+            return 0;
+        }
+        let Ok(c) = Container::parse(&self.dxil) else {
+            return 0;
+        };
+        let components = |fourcc| {
+            c.part(fourcc)
+                .and_then(|p| signature(p.data, false).ok())
+                .map_or(0, |els| els.iter().map(|e| u32::from(e.cols)).sum::<u32>())
+        };
+        // PSV0: its runtime info's size, then the info (mesh maxima at 12
+        // and 14).
+        let max = |at: usize| {
+            c.part(FourCC::PSV0)
+                .and_then(|p| p.data.get(4 + at..6 + at))
+                .map_or(0, |b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        4 * (components(FourCC::OSG1) * max(12).next_multiple_of(32)
+            + components(FourCC::PSG1) * max(14).next_multiple_of(32))
+    }
+}
+
+/// The most bytes of vertex plus primitive outputs the validator allows a
+/// mesh shader.
+pub const MESH_OUTPUT_LIMIT: u32 = 32768;
+
+/// The inputs of the translated pixel shader a vertex or mesh shader
+/// feeds, for [`translate_linked`]: the elements the previous stage
+/// provides (arbitrary, position, clip and cull) as its `PSV0` lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    inputs: Vec<container::SigElement>,
+}
+
+impl Link {
+    pub fn pixel(ps: &HostShader) -> Result<Self, ShaderError> {
+        let [inputs, ..] =
+            psv_elements(&ps.dxil).ok_or(ShaderError::Malformed("a pixel shader without PSV0"))?;
+        let inputs = inputs
+            .into_iter()
+            .filter(|e| matches!(e.kind, 0 | 3 | 6 | 7))
+            .map(|e| container::SigElement {
+                name: e.name,
+                index: e.index,
+                kind: e.kind,
+                comp: match e.comp {
+                    1 => 5,
+                    2 => 4,
+                    _ => 9,
+                },
+                interp: e.interp,
+                row: Some(u32::from(e.row)),
+                col: e.col,
+                cols: e.cols,
+                usage: 0,
+                half: false,
+                console_read: true,
+            })
+            .collect();
+        Ok(Self { inputs })
+    }
+
+    /// The pixel input that reads `e`: the same semantic.
+    fn reads(&self, e: &container::SigElement) -> Option<&container::SigElement> {
+        self.inputs.iter().find(|i| {
+            i.kind == e.kind
+                && i.index == e.index
+                && (e.kind != 0 || i.name.eq_ignore_ascii_case(&e.name))
+        })
+    }
+
+    /// What a shader writing `outputs` and `prims` (the console's
+    /// elements) declares linked: each element the pixel shader reads in
+    /// the input's place (row, columns, type and mode); a system value it
+    /// does not read on a row of its own past the pixel shader's; other
+    /// elements left out; and the inputs nothing writes, declared unwritten
+    /// so the stages link.
+    fn declare(
+        &self,
+        outputs: &[container::SigElement],
+        prims: &[container::SigElement],
+    ) -> lower::Linked {
+        let mut free = self
+            .inputs
+            .iter()
+            .filter_map(|i| i.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        let mut written = Vec::new();
+        let mut place = |elements: &[container::SigElement],
+                         declared: &mut Vec<container::SigElement>| {
+            elements
+                .iter()
+                .map(|e| {
+                    let at = match self.reads(e) {
+                        Some(i) => {
+                            written.push(i.clone());
+                            // The name as the shader writes it (`PSV0`
+                            // leaves system values unnamed).
+                            container::SigElement {
+                                name: e.name.clone(),
+                                usage: 0,
+                                half: e.half,
+                                ..i.clone()
+                            }
+                        }
+                        None if e.kind != 0 && e.row.is_some() => {
+                            free += 1;
+                            container::SigElement {
+                                row: Some(free - 1),
+                                col: 0,
+                                usage: 0,
+                                ..e.clone()
+                            }
+                        }
+                        None => return None,
+                    };
+                    declared.push(at);
+                    Some(declared.len() - 1)
+                })
+                .collect()
+        };
+        let mut linked = lower::Linked::default();
+        linked.out_ids = place(outputs, &mut linked.outputs);
+        linked.prim_ids = place(prims, &mut linked.prims);
+        for i in &self.inputs {
+            if i.kind == 0 && !written.contains(i) {
+                linked.outputs.push(i.clone());
+            }
+        }
+        linked
+    }
+}
+
+/// How a pixel shader's inputs fail to link to a vertex or mesh shader's
+/// outputs (both translated), from their `PSV0` parts: per arbitrary,
+/// position, clip or cull input, an output (or per-primitive output) of
+/// the same semantic must sit at the same row and first column, cover the
+/// input's columns and use the same interpolation mode. Empty when they
+/// link.
+pub fn link_mismatches(first: &HostShader, ps: &HostShader) -> Vec<String> {
+    let (Some([_, outputs, prims]), Some([inputs, ..])) =
+        (psv_elements(&first.dxil), psv_elements(&ps.dxil))
+    else {
+        return vec!["no PSV0".to_owned()];
+    };
+    let mut out = Vec::new();
+    for i in inputs.iter().filter(|i| matches!(i.kind, 0 | 3 | 6 | 7)) {
+        let what = format!("{}{}", i.name, i.index);
+        let same = |o: &&PsvElement| {
+            o.kind == i.kind && o.index == i.index && o.name.eq_ignore_ascii_case(&i.name)
+        };
+        let Some(o) = outputs.iter().chain(&prims).find(same) else {
+            out.push(format!("{what} not written"));
+            continue;
+        };
+        if o.row != i.row || o.col != i.col || o.cols < i.cols {
+            out.push(format!(
+                "{what} at {}.{}+{} read at {}.{}+{}",
+                o.row, o.col, o.cols, i.row, i.col, i.cols
+            ));
+        }
+        if o.interp != i.interp {
+            out.push(format!("{what} mode {} read as {}", o.interp, i.interp));
+        }
+    }
+    out
+}
+
+/// A signature element as `PSV0` lists it.
+struct PsvElement {
+    name: String,
+    index: u32,
+    row: u8,
+    col: u8,
+    cols: u8,
+    kind: u8,
+    comp: u8,
+    interp: u8,
+}
+
+/// The inputs, outputs and per-primitive outputs a translated shader's
+/// `PSV0` lists (the layout [`container::psv`] writes).
+fn psv_elements(dxil: &[u8]) -> Option<[Vec<PsvElement>; 3]> {
+    let c = Container::parse(dxil).ok()?;
+    let d = c.part(FourCC::PSV0)?.data;
+    let word = |at: usize| crate::dxbc::u32_at(d, at).ok().map(|v| v as usize);
+    let info = word(0)?;
+    let counts = [*d.get(4 + 28)?, *d.get(4 + 29)?, *d.get(4 + 30)?];
+    let mut at = 4 + info;
+    let bindings = word(at)?;
+    at += 4;
+    if bindings > 0 {
+        at += 4 + word(at)? * bindings;
+    }
+    let strings = d.get(at + 4..at + 4 + word(at)?)?;
+    at += 4 + strings.len();
+    let indices = word(at)?;
+    let index_at = at + 4;
+    at += 4 + 4 * indices;
+    let size = match counts.iter().map(|&n| usize::from(n)).sum::<usize>() {
+        0 => 0,
+        _ => {
+            at += 4;
+            word(at - 4)?
+        }
+    };
+    let mut lists: [Vec<PsvElement>; 3] = Default::default();
+    let mut k = 0;
+    for (list, n) in lists.iter_mut().zip(counts) {
+        for _ in 0..n {
+            let e = at + size * k;
+            k += 1;
+            let name = strings.get(word(e)?..)?.split(|&b| b == 0).next()?;
+            let b = d.get(e + 8..e + 14)?;
+            list.push(PsvElement {
+                name: String::from_utf8_lossy(name).into_owned(),
+                index: word(index_at + 4 * word(e + 4)?)? as u32,
+                row: b[1],
+                col: b[2] >> 4 & 3,
+                cols: b[2] & 0xf,
+                kind: b[3],
+                comp: b[4],
+                interp: b[5],
+            });
+        }
+    }
+    Some(lists)
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -183,9 +474,81 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// A descriptor a shader reads at a fixed position and the view it
+/// declares for it (the DXIL resource properties of its handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeclaredView {
+    /// Root parameter index of the table (as [`UserData::slot`]); none for
+    /// the resource heap itself.
+    pub slot: Option<u8>,
+    /// The descriptor's position in the table (or the heap).
+    pub index: u32,
+    pub kind: ViewKind,
+    /// Unordered access.
+    pub uav: bool,
+}
+
+/// What a declared view is: a texture of a D3D12 dimension or a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ViewKind {
+    /// A texture; the value is its `D3D12_SRV_DIMENSION` (the unordered
+    /// access dimensions share the numbers for the kinds they have).
+    Texture(u8),
+    /// Typed (`buffer_load_format`): four 32-bit float channels.
+    Typed,
+    Raw,
+    /// Structured, with the element size in bytes.
+    Structured(u32),
+}
+
+impl ViewKind {
+    /// The D3D12 view dimension: buffer (1) or the texture's.
+    pub fn dimension(self) -> u8 {
+        match self {
+            ViewKind::Texture(d) => d,
+            _ => 1,
+        }
+    }
+}
+
+impl DeclaredView {
+    /// The view a handle with DXIL resource properties `props` declares;
+    /// none for constant buffers and samplers.
+    pub(crate) fn from_props(slot: Option<u8>, index: u32, props: (u32, u32)) -> Option<Self> {
+        // DXIL resource kinds → D3D12 SRV dimensions.
+        let kind = match props.0 & 0xFF {
+            1 => ViewKind::Texture(2),  // 1D
+            2 => ViewKind::Texture(4),  // 2D
+            3 => ViewKind::Texture(6),  // 2D MS
+            4 => ViewKind::Texture(8),  // 3D
+            5 => ViewKind::Texture(9),  // cube
+            6 => ViewKind::Texture(3),  // 1D array
+            7 => ViewKind::Texture(5),  // 2D array
+            8 => ViewKind::Texture(7),  // 2D MS array
+            9 => ViewKind::Texture(10), // cube array
+            10 => ViewKind::Typed,
+            11 => ViewKind::Raw,
+            12 => ViewKind::Structured(props.1),
+            _ => return None,
+        };
+        Some(DeclaredView {
+            slot,
+            index,
+            kind,
+            uav: props.0 & 0x1000 != 0,
+        })
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_linked(container, None)
+}
+
+/// [`translate`], a vertex or mesh program declaring only the outputs
+/// `link` reads.
+pub fn translate_linked(container: &[u8], link: Option<&Link>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,10 +569,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(&c, &native, &p, &st, &io, &res, link)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran; a vertex or mesh
+/// program declares only the outputs `link` reads.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -217,20 +581,21 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    link: Option<&Link>,
 ) -> Result<HostShader, ShaderError> {
-    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+    let sig = |fourcc, input| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
-            Some(part) => signature(part.data),
+            Some(part) => signature(part.data, input),
             None => Ok(Vec::new()),
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = sig(FourCC::ISG1, true)?;
+    let mut outputs = sig(FourCC::OSG1, false)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -241,14 +606,51 @@ pub fn emit(
             _ => 0,
         };
     }
+    if pixel {
+        // The console packs the front face into a row of attributes; PC
+        // wants one mode per row, and the rasterizer makes the value, so it
+        // gets a row of its own.
+        let shared = |e: &container::SigElement, all: &[container::SigElement]| {
+            all.iter()
+                .any(|o| o.kind != 13 && o.row.is_some() && o.row == e.row)
+        };
+        let free = interpolated
+            .iter()
+            .filter_map(|e| e.row)
+            .max()
+            .map_or(0, |r| r + 1);
+        if let Some(id) = interpolated
+            .iter()
+            .position(|e| e.kind == 13 && shared(e, interpolated))
+        {
+            interpolated[id].row = Some(free);
+            interpolated[id].col = 0;
+        }
+    } else {
+        // Vertex and mesh outputs: one mode per row (PC packing). The pixel
+        // shader's inputs choose how values are interpolated.
+        uniform_rows(interpolated);
+    }
+    // Conservative depth (SV_DepthLessEqual, SV_DepthGreaterEqual) needs a
+    // centroid or sample position on PC, which moves SV_Position off the
+    // pixel center the console reads; plain depth keeps the console's
+    // values (only the early depth test is lost).
+    if pixel {
+        for e in outputs.iter_mut().filter(|e| matches!(e.kind, 18 | 19)) {
+            e.kind = 17;
+            e.name = "SV_Depth".into();
+        }
+    }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
+    let mut prims = sig(FourCC::PSG1, false)?;
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
         e.interp = 1;
     }
+    // Linked to a pixel shader: its inputs' layout.
+    let linked = link.filter(|_| !pixel).map(|l| l.declare(&outputs, &prims));
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -275,6 +677,7 @@ pub fn emit(
         inputs,
         outputs,
         prims,
+        linked,
         mesh_stride,
     })?;
     Ok(HostShader {
@@ -296,11 +699,31 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        atomic64_views: l.atomic64_views,
+        views: l.views,
     })
 }
 
+/// Elements sharing a row get one interpolation mode (constant where they
+/// differ), as PC signatures pack them.
+pub(crate) fn uniform_rows(elements: &mut [container::SigElement]) {
+    for i in 0..elements.len() {
+        let Some(row) = elements[i].row else {
+            continue;
+        };
+        let in_row = |e: &container::SigElement| e.row == Some(row);
+        let mode = elements[i].interp;
+        if elements.iter().any(|e| in_row(e) && e.interp != mode) {
+            for e in elements.iter_mut().filter(|e| in_row(e)) {
+                e.interp = 1;
+            }
+        }
+    }
+}
+
 /// The rows of an `ISG1`/`OSG1` part.
-fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+fn signature(part: &[u8], input: bool) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
@@ -312,9 +735,10 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             .get(name_at..)
             .and_then(|s| s.split(|&b| b == 0).next())
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
-        let mask = *part
-            .get(at + 24)
-            .ok_or(ShaderError::Malformed("truncated"))?;
+        let (mask, rw) = match part.get(at + 24..at + 26) {
+            Some(&[mask, rw]) => (mask, rw),
+            _ => return Err(ShaderError::Malformed("truncated")),
+        };
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -346,6 +770,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -385,6 +810,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             cols: mask.count_ones().max(1) as u8,
             usage: 0,
             half: (4..=6).contains(&raw),
+            console_read: !input || rw != 0,
         });
     }
     Ok(out)
@@ -441,7 +867,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
+        if let Err(e) = emit(&c, &native, &p, &st, &io, &res, None) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
     }
@@ -460,6 +886,7 @@ mod tests {
             cols: 4,
             usage: 15,
             half: false,
+            console_read: true,
         });
         let b = s.entry;
         for (c, v) in [1.0f32, 0.5, 0.25, 1.0].into_iter().enumerate() {
@@ -473,6 +900,159 @@ mod tests {
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
         s.finish()
+    }
+
+    #[test]
+    fn rows_mixing_modes_become_constant() {
+        let e = |row, col, interp| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 0,
+            half: false,
+            console_read: true,
+        };
+        let mut sig = [e(0, 0, 2), e(0, 1, 1), e(1, 0, 2), e(1, 1, 2)];
+        super::uniform_rows(&mut sig);
+        let modes: Vec<u8> = sig.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 2, 2]);
+    }
+
+    fn element(name: &str, kind: u8, row: u32, cols: u8, interp: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+            console_read: true,
+        }
+    }
+
+    /// A translated shader with these signatures and no code.
+    fn shell(
+        stage: crate::HwStage,
+        ins: Vec<SigElement>,
+        outs: Vec<SigElement>,
+    ) -> super::HostShader {
+        let mut s = Shader::new(stage == crate::HwStage::Ps);
+        s.inputs = ins;
+        s.outputs = outs;
+        if stage == crate::HwStage::Ms {
+            s.prims = vec![element("PRIM", 0, 0, 1, 1)];
+            s.threads = Some([128, 1, 1]);
+            s.mesh = Some(super::shader::Mesh {
+                max_vertices: 100,
+                max_primitives: 64,
+                topology: 2,
+            });
+        }
+        let b = s.entry;
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        super::HostShader {
+            stage,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            atomic64_views: Vec::new(),
+            views: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mesh_outputs_count_every_component_of_32_rounded_maxima() {
+        let outs = vec![
+            element("SV_Position", 3, 0, 4, 4),
+            element("TEXCOORD", 0, 1, 3, 2),
+        ];
+        let ms = shell(crate::HwStage::Ms, Vec::new(), outs);
+        assert_eq!(ms.mesh_output_bytes(), 4 * (7 * 128 + 64));
+        let vs = shell(crate::HwStage::Vs, Vec::new(), Vec::new());
+        assert_eq!(vs.mesh_output_bytes(), 0);
+    }
+
+    #[test]
+    fn pixel_inputs_link_at_the_rows_and_modes_written() {
+        let vs = shell(
+            crate::HwStage::Vs,
+            Vec::new(),
+            vec![
+                element("SV_Position", 3, 0, 4, 4),
+                element("TEXCOORD", 0, 1, 4, 2),
+            ],
+        );
+        let ps = |row, interp| {
+            shell(
+                crate::HwStage::Ps,
+                vec![
+                    element("SV_Position", 3, 0, 4, 4),
+                    element("TEXCOORD", 0, row, 2, interp),
+                ],
+                vec![element("SV_Target", 16, 0, 4, 0)],
+            )
+        };
+        assert!(super::link_mismatches(&vs, &ps(1, 2)).is_empty());
+        assert_eq!(
+            super::link_mismatches(&vs, &ps(2, 2)),
+            ["TEXCOORD0 at 1.0+4 read at 2.0+2"]
+        );
+        assert_eq!(
+            super::link_mismatches(&vs, &ps(1, 1)),
+            ["TEXCOORD0 mode 2 read as 1"]
+        );
+    }
+
+    #[test]
+    fn links_place_outputs_where_the_pixel_shader_reads_them() {
+        let mut texcoord = element("TEXCOORD", 0, 1, 2, 1);
+        texcoord.col = 2;
+        texcoord.comp = 5;
+        let color = element("COLOR", 0, 2, 4, 2);
+        // `PSV0` names no system value.
+        let link = super::Link {
+            inputs: vec![element("", 3, 0, 4, 4), texcoord.clone(), color.clone()],
+        };
+        let mut unread = element("TEXCOORD", 0, 6, 4, 2);
+        unread.index = 1;
+        let outputs = [
+            element("TEXCOORD", 0, 5, 4, 2),
+            unread,
+            element("SV_Position", 3, 2, 4, 4),
+            element("SV_ClipDistance", 6, 7, 1, 2),
+        ];
+        let linked = link.declare(&outputs, &[]);
+        assert_eq!(linked.out_ids, [Some(0), None, Some(1), Some(2)]);
+        let rows: Vec<_> = linked
+            .outputs
+            .iter()
+            .map(|e| (e.row, e.col, e.cols))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some(1), 2, 2),
+                (Some(0), 0, 4),
+                (Some(3), 0, 1),
+                (Some(2), 0, 4)
+            ]
+        );
+        assert_eq!(linked.outputs[1].name, "SV_Position");
+        assert_eq!((linked.outputs[0].comp, linked.outputs[0].interp), (5, 1));
+        assert_eq!(linked.outputs[3], color);
     }
 
     #[test]
@@ -490,6 +1070,9 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            atomic64_views: Vec::new(),
+            views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -500,6 +1083,9 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                atomic64_views: Vec::new(),
+                views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -583,6 +1169,7 @@ mod tests {
             cols: 1,
             usage: 0,
             half: false,
+            console_read: true,
         };
         let isg1 = super::container::signature(&[w_only], true);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
@@ -592,6 +1179,119 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
-        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+        let _ = super::emit(&c, &native, &p, &st, &io, &res, None);
+    }
+
+    /// A compute program whose root signature spills past the 16 user-data
+    /// registers: a root UAV and a root constant read from the spill
+    /// table, a dword loaded from the UAV, the sum stored back into it.
+    #[test]
+    #[cfg(windows)]
+    fn spilled_root_uav_is_read_and_written() {
+        use crate::native::{
+            ComputeIo, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+        };
+        let words: [u32; 18] = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0x8703_FF01,
+            0x0000_00FF, // s_and_b32 s3, s1, 0xff
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0xF400_0301,
+            0xFA00_0008, // s_load_dword s12, s[2:3], 0x8
+            0xF400_0344,
+            0xFA00_0000, // s_load_dword s13, s[8:9], null
+            0xBE8A_03C1, // s_mov_b32 s10, -1
+            0xBE8B_03FF,
+            0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+            0x3400_0082, // v_lshlrev_b32 v0, 2, v0
+            0xE070_1000,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let used = |kind, root, user_data, slot| UsedResource {
+            kind,
+            root,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Descriptor, 2, 16, 0),
+                param(RootType::Constants, 1, 18, 1),
+            ],
+            used: vec![
+                used(ResourceType::Uav, RootType::Descriptor, 16, 0),
+                used(ResourceType::Cbv, RootType::Constants, 18, 1),
+            ],
+            // Four user SGPRs, one thread id VGPR.
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 4 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let c = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let cs = super::emit(&c, &native, &p, &st, &io, &res, None).unwrap();
+        assert_eq!(cs.root_uavs, [0]);
+        assert!(cs.root_cbvs.is_empty() && cs.root_srvs.is_empty());
+        let constant: Vec<_> = cs.user_data.iter().map(|u| (u.index, u.slot)).collect();
+        assert_eq!(constant, [(18, 1)]);
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut cs.dxil.clone()).unwrap();
+        }
+        match super::host::Host::new(true) {
+            Ok(host) => {
+                host.compute_pipeline(&cs).unwrap();
+            }
+            Err(e) => eprintln!("no WARP device ({e}); pipeline not made"),
+        }
+    }
+
+    /// Handle properties name the view a shader declares: textures by
+    /// their D3D12 dimension, buffers by how they are read, UAVs by bit 12.
+    #[test]
+    fn declared_views_from_handle_properties() {
+        use super::{DeclaredView, ViewKind};
+        let v = |props| DeclaredView::from_props(Some(3), 7, props).map(|d| (d.kind, d.uav));
+        assert_eq!(v((2, 0x409)), Some((ViewKind::Texture(4), false)));
+        assert_eq!(v((7 | 0x1000, 0x105)), Some((ViewKind::Texture(5), true)));
+        assert_eq!(v((1, 0x409)), Some((ViewKind::Texture(2), false)));
+        assert_eq!(v((4, 0x409)), Some((ViewKind::Texture(8), false)));
+        assert_eq!(v((10, 0x409)), Some((ViewKind::Typed, false)));
+        assert_eq!(v((11 | 0x1000, 0)), Some((ViewKind::Raw, true)));
+        assert_eq!(v((12, 16)), Some((ViewKind::Structured(16), false)));
+        // Constant buffers and samplers declare no view.
+        assert_eq!(v((13, 0)), None);
+        assert_eq!(v((14, 0)), None);
+        assert_eq!(ViewKind::Raw.dimension(), 1);
+        assert_eq!(ViewKind::Texture(5).dimension(), 5);
     }
 }

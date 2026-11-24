@@ -59,6 +59,7 @@ pub(crate) enum Bin {
     Mul = 2,
     UDiv = 3,
     SDiv = 4,
+    SRem = 6,
     URem = 5,
     Shl = 7,
     LShr = 8,
@@ -259,6 +260,14 @@ impl Module {
 
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
+    }
+    /// The value of an integer constant.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        let V::Const(i) = v else { return None };
+        match self.consts.get(i as usize) {
+            Some((_, Const::Int(x))) => Some(*x),
+            _ => None,
+        }
     }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);

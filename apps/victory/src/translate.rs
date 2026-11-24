@@ -31,6 +31,15 @@ struct Tally {
     opaque: usize,
     lane_branches: usize,
     uniform_branches: usize,
+    /// Data joins with a lane mask on some edge: edges no lane reading
+    /// the join comes over, and joins some such lane reads.
+    dead_mask_edges: usize,
+    live_mask_joins: usize,
+    /// Those in compute programs, and the ones of them whose wave-wide
+    /// value is known (`WaveJoin`), with uniform branches among them.
+    cs_mask_joins: usize,
+    cs_wave_joins: usize,
+    cs_uniform_joins: usize,
     tracked: usize,
     loaded: usize,
     built: usize,
@@ -102,6 +111,11 @@ impl Tally {
         self.opaque += other.opaque;
         self.lane_branches += other.lane_branches;
         self.uniform_branches += other.uniform_branches;
+        self.dead_mask_edges += other.dead_mask_edges;
+        self.live_mask_joins += other.live_mask_joins;
+        self.cs_mask_joins += other.cs_mask_joins;
+        self.cs_wave_joins += other.cs_wave_joins;
+        self.cs_uniform_joins += other.cs_uniform_joins;
         self.tracked += other.tracked;
         self.loaded += other.loaded;
         self.built += other.built;
@@ -140,14 +154,31 @@ impl Tally {
     }
 }
 
-/// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+/// An emitted vertex, mesh or pixel shader kept for `VICTORY_PAIRS`.
+struct KeptShader {
+    label: String,
+    /// The first 16 hex digits of the container's BLAKE3, as run logs name
+    /// shaders.
+    hash: String,
+    /// The BLAKE3 of its DXIL part (duplicates point at it).
+    dxil: blake3::Hash,
+    container: Vec<u8>,
+    shader: emit::HostShader,
+}
+
+/// Shaders kept for `VICTORY_PAIRS`, shared between threads, and the
+/// container hashes of duplicates with the DXIL hash of their original.
+#[derive(Default)]
+struct Kept {
+    shaders: Vec<KeptShader>,
+    aliases: Vec<(String, blake3::Hash)>,
+}
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
-    /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
-    /// kept to build those pipelines after the walk.
-    keep: Option<Kept>,
+    /// Vertex, mesh and pixel shaders, kept to build the pipelines of
+    /// `VICTORY_PAIRS` after the walk.
+    keep: Option<std::sync::Arc<Mutex<Kept>>>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
 }
@@ -172,13 +203,21 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    // `VICTORY_PAIRS`: comma-separated `first+pixel` pairs, each a label
+    // substring or a container hash prefix as run logs give it; the entry
+    // `oversized` pairs every mesh shader whose outputs exceed the
+    // validator's limit with the pixel shaders of its effect.
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .filter_map(|p| match p.trim() {
+            "oversized" => Some(("oversized".to_owned(), String::new())),
+            p => p
+                .split_once('+')
+                .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned())),
+        })
         .collect();
-    let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::new(Mutex::new(Kept::default()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -242,6 +281,16 @@ pub fn run(
         t.uniform_branches
     );
     println!(
+        "mask joins   {} read ({} edges proven dead); compute {}: {} exact ({} uniform), \
+         {} refused",
+        t.live_mask_joins,
+        t.dead_mask_edges,
+        t.cs_mask_joins,
+        t.cs_wave_joins,
+        t.cs_uniform_joins,
+        t.cs_mask_joins - t.cs_wave_joins
+    );
+    println!(
         "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
          {} scalar accesses; {} with a computed term)",
         t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
@@ -271,22 +320,7 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
-        }
+        link_pairs(&pairs, &lock(&kept), dll.as_deref(), pipelines)?;
     }
     let mut lines = t.lines;
     lines.sort();
@@ -319,8 +353,13 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let dxil_hash = blake3::hash(dxil);
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    if !lock(seen).insert(dxil_hash) {
         t.duplicates += 1;
+        if let Some(keep) = &checks.keep {
+            lock(keep).aliases.push((hash, dxil_hash));
+        }
         return;
     }
     let programs = match native_programs(dxil) {
@@ -370,7 +409,7 @@ fn translate(
                 }
                 let structured = match structure::structure(&program) {
                     Ok(s) => {
-                        tally_structured(&program, &s, t);
+                        tally_structured(&program, &s, compute, t);
                         Some(s)
                     }
                     Err(e) => {
@@ -386,9 +425,20 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(&container, &p, &program, &s, &i, &r, None) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            if let Some(keep) = &checks.keep
+                                && matches!(shader.stage, HwStage::Vs | HwStage::Ms | HwStage::Ps)
+                            {
+                                lock(keep).shaders.push(KeptShader {
+                                    label: label(),
+                                    hash: hash.clone(),
+                                    dxil: dxil_hash,
+                                    container: bytes.to_vec(),
+                                    shader: shader.clone(),
+                                });
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -417,9 +467,6 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
-    }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
@@ -489,6 +536,167 @@ fn check(
     }
 }
 
+/// The pipelines of `VICTORY_PAIRS`: a mesh shader whose outputs exceed
+/// the validator's limit is translated again declaring only what the
+/// pixel shader reads (`emit::translate_linked`), as the host pipeline
+/// path does; each pair reports the output bytes, the validator's verdict
+/// on the first stage, how the signatures link (`emit::link_mismatches`)
+/// and, with `--pipelines`, whether the host creates the pipeline
+/// (`VICTORY_D3D12_WARP` set: on WARP).
+fn link_pairs(
+    pairs: &[(String, String)],
+    kept: &Kept,
+    dll: Option<&Path>,
+    pipelines: bool,
+) -> Result<()> {
+    let host = match pipelines {
+        true => Some(
+            Host::new(std::env::var_os("VICTORY_D3D12_WARP").is_some())
+                .map_err(anyhow::Error::msg)?,
+        ),
+        false => None,
+    };
+    let mut validator = Validator::load(dll).ok();
+    let find = |name: &str| {
+        let dxil = kept
+            .aliases
+            .iter()
+            .find(|(h, _)| h.starts_with(name))
+            .map(|a| a.1);
+        kept.shaders
+            .iter()
+            .find(|k| k.hash.starts_with(name) || dxil == Some(k.dxil) || k.label.contains(name))
+    };
+    let mut list: Vec<(&KeptShader, &KeptShader)> = Vec::new();
+    let mut missing = 0;
+    for (first, ps) in pairs {
+        if first == "oversized" {
+            list.extend(oversized_pairs(kept));
+            continue;
+        }
+        match (find(first), find(ps)) {
+            (Some(a), Some(b)) => list.push((a, b)),
+            _ => {
+                missing += 1;
+                println!("pair {first} + {ps}: not emitted");
+            }
+        }
+    }
+    let (mut fit, mut validated, mut linked_ok, mut created) = (0, 0, 0, 0);
+    let (mut oversized, mut unlinked) = (0, 0);
+    for (first, ps) in &list {
+        // As the host pipeline path does: the first stage translated again
+        // in the pixel shader's input layout when it is too big or does
+        // not link as it stands.
+        let before = first.shader.mesh_output_bytes();
+        let unlinking = emit::link_mismatches(&first.shader, &ps.shader).len();
+        oversized += usize::from(before > emit::MESH_OUTPUT_LIMIT);
+        unlinked += usize::from(unlinking > 0);
+        let relink = before > emit::MESH_OUTPUT_LIMIT || unlinking > 0;
+        let linked = if relink {
+            emit::Link::pixel(&ps.shader)
+                .and_then(|l| emit::translate_linked(&first.container, Some(&l)))
+                .map_err(|e| format!("linked translation: {e}"))
+        } else {
+            Ok(first.shader.clone())
+        };
+        let result = linked.map(|s| {
+            let after = s.mesh_output_bytes();
+            fit += usize::from(after <= emit::MESH_OUTPUT_LIMIT);
+            let verdict = match validator.as_mut().map(|v| v.validate(&mut s.dxil.clone())) {
+                Some(Ok(())) => {
+                    validated += 1;
+                    "validated".to_owned()
+                }
+                Some(Err(text)) => text
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or("validator error")
+                    .to_owned(),
+                None => "not validated".to_owned(),
+            };
+            let mismatches = emit::link_mismatches(&s, &ps.shader);
+            let link = if mismatches.is_empty() {
+                linked_ok += 1;
+                "signatures link".to_owned()
+            } else {
+                format!("signatures: {}", mismatches.join(", "))
+            };
+            let made = host.as_ref().map(|host| {
+                let made = if s.stage == HwStage::Ms {
+                    host.mesh_pipeline(&s, &ps.shader)
+                } else {
+                    host.pipeline(&s, &ps.shader)
+                };
+                match made {
+                    Ok(_) => {
+                        created += 1;
+                        "; pipeline created".to_owned()
+                    }
+                    Err(e) => format!("; pipeline: {e}"),
+                }
+            });
+            let made = made.unwrap_or_default();
+            let how = if relink { "relinked" } else { "as is" };
+            format!(
+                "outputs {before} -> {after} bytes, {unlinking} link mismatches; {how}; \
+                 {verdict}; {link}{made}"
+            )
+        });
+        let line = result.unwrap_or_else(|e| e);
+        println!("pair {} + {}: {line}", first.label, ps.label);
+    }
+    println!(
+        "pairs        {} found ({missing} not emitted), before: {oversized} past the output \
+         limit, {unlinked} not linking; after: {fit} within the limit, {validated} validated, \
+         {linked_ok} linking, {created} pipelines",
+        list.len()
+    );
+    Ok(())
+}
+
+/// Every mesh shader past the output limit with the pixel shaders of its
+/// effect: the same name suffix (`<name>_<8 hex>_Wrapped`), one per pixel
+/// shader name, the record nearest the mesh shader's in the same file.
+fn oversized_pairs(kept: &Kept) -> Vec<(&KeptShader, &KeptShader)> {
+    // (file, record offset, effect suffix, shader name) of a label.
+    let parse = |label: &str| {
+        let (file, rest) = label.split_once('@')?;
+        let (offset, rest) = rest.split_once(' ')?;
+        let offset = u64::from_str_radix(offset.trim_start_matches("0x"), 16).ok()?;
+        let name = rest.split(' ').next()?.strip_suffix("_Wrapped")?;
+        let (_, effect) = name.rsplit_once('_')?;
+        Some((file.to_owned(), offset, effect.to_owned(), name.to_owned()))
+    };
+    let pixels: Vec<_> = kept
+        .shaders
+        .iter()
+        .filter(|k| k.shader.stage == HwStage::Ps)
+        .filter_map(|k| Some((parse(&k.label)?, k)))
+        .collect();
+    let mut out = Vec::new();
+    for ms in kept.shaders.iter().filter(|k| {
+        k.shader.stage == HwStage::Ms && k.shader.mesh_output_bytes() > emit::MESH_OUTPUT_LIMIT
+    }) {
+        let Some((file, offset, effect, _)) = parse(&ms.label) else {
+            continue;
+        };
+        let mut nearest: BTreeMap<&str, (u64, &KeptShader)> = BTreeMap::new();
+        for ((f, o, e, name), ps) in &pixels {
+            if *f != file || *e != effect {
+                continue;
+            }
+            let d = o.abs_diff(offset);
+            let best = nearest.entry(name).or_insert((d, ps));
+            if d < best.0 {
+                *best = (d, ps);
+            }
+        }
+        out.extend(nearest.into_values().map(|(_, ps)| (ms, ps)));
+    }
+    out
+}
+
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
 /// 3 pipelines.
 fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
@@ -519,8 +727,11 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
     for (_, i) in &r.interps {
         match i {
-            io::Interp::Interpolated { .. } => t.interpolated += 1,
+            io::Interp::Interpolated { .. } | io::Interp::Raw { second: true, .. } => {
+                t.interpolated += 1
+            }
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Raw { .. } => {}
         }
     }
     for e in &r.exports {
@@ -628,8 +839,24 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     t.unlisted += traced.difference(&listed).count();
 }
 
-fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Tally) {
+fn tally_structured(
+    program: &ir::Program,
+    s: &structure::Structured,
+    compute: bool,
+    t: &mut Tally,
+) {
     t.structured += 1;
+    t.dead_mask_edges += s.dead_mask_edges.len();
+    t.live_mask_joins += s.live_mask_joins;
+    if compute {
+        t.cs_mask_joins += s.live_mask_joins;
+        t.cs_wave_joins += s.wave_joins.len();
+        t.cs_uniform_joins += s
+            .wave_joins
+            .values()
+            .filter(|&&w| w == structure::WaveJoin::Uniform)
+            .count();
+    }
     for (block, guards) in program.blocks.iter().zip(&s.guards) {
         t.vector += block
             .insts

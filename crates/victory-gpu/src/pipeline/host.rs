@@ -251,6 +251,7 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -321,12 +322,25 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
         }
         let host = host()?;
+        let atomics = stages.iter().any(|(s, _)| {
+            s.translated()
+                .is_some_and(|t| !t.host.atomic64_views.is_empty())
+        });
+        if atomics && !host.typed_atomics_64() {
+            return refuse(
+                "the host GPU has no 64-bit atomics on typed heap views",
+                shaders,
+            );
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -339,6 +353,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -365,6 +380,11 @@ impl HostPipeline {
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
                 ),
             ] {
                 for &slot in slots {
@@ -457,14 +477,23 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
+        // The vertex or mesh shader in the pixel shader's input layout when
+        // it does not link as it stands or declares too much.
+        let linked = find("pixel").and_then(|ps| linked_first(stages[0].0, ps));
+        let first = linked
+            .as_ref()
+            .map_or(code(0), |dxil| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            });
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&first), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, first, code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -472,7 +501,7 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(?shaders, linked = linked.is_some(), "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -489,7 +518,7 @@ impl HostPipeline {
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
+            VS: first,
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
@@ -515,7 +544,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&first), &code_bytes(&code(1))],
             &state,
         );
         let made = super::library::pipeline(
@@ -533,7 +562,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, linked = linked.is_some(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -555,6 +584,69 @@ impl HostPipeline {
             inputs: g.elements(),
         })
     }
+}
+
+/// A vertex or mesh shader translated again in `ps`'s input layout
+/// (`victory_shader::emit::translate_linked`) when its outputs do not link
+/// to `ps`'s inputs as they stand (the console links by semantic, its
+/// stages' registers differ) or exceed what the validator allows a mesh
+/// shader (`MESH_OUTPUT_LIMIT`); once per pair. `None` when it links as it
+/// is, or the linked translation fails or binds differently.
+fn linked_first(first: &Arc<Shader>, ps: &Arc<Shader>) -> Option<Arc<Vec<u8>>> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use victory_shader::emit::{Link, MESH_OUTPUT_LIMIT, link_mismatches, translate_linked};
+    type Pairs = HashMap<(String, String), Option<Arc<Vec<u8>>>>;
+    static LINKED: LazyLock<Mutex<Pairs>> = LazyLock::new(Mutex::default);
+    let full = &first.translated()?.host;
+    let pixel = &ps.translated()?.host;
+    let bytes = full.mesh_output_bytes();
+    let mismatches = link_mismatches(full, pixel);
+    if bytes <= MESH_OUTPUT_LIMIT && mismatches.is_empty() {
+        return None;
+    }
+    let key = (first.hash.clone(), ps.hash.clone());
+    if let Some(done) = LINKED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return done.clone();
+    }
+    let made = Link::pixel(pixel)
+        .and_then(|link| translate_linked(&first.container, Some(&link)))
+        .map_err(|e| e.to_string())
+        .and_then(|l| {
+            let same = l.user_data == full.user_data
+                && l.samplers == full.samplers
+                && l.static_samplers == full.static_samplers
+                && l.root_cbvs == full.root_cbvs
+                && l.root_srvs == full.root_srvs;
+            if same {
+                Ok(l)
+            } else {
+                Err("the linked translation binds differently".to_owned())
+            }
+        });
+    let done = match made {
+        Ok(l) => {
+            tracing::info!(
+                first = %first.hash,
+                ps = %ps.hash,
+                bytes,
+                linked_bytes = l.mesh_output_bytes(),
+                mismatches = mismatches.len(),
+                left = link_mismatches(&l, pixel).len(),
+                "outputs placed in the pixel shader's input layout"
+            );
+            Some(Arc::new(l.dxil))
+        }
+        Err(error) => {
+            tracing::warn!(first = %first.hash, ps = %ps.hash, bytes, %error, "outputs not relinked");
+            None
+        }
+    };
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, done.clone());
+    done
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
@@ -585,15 +677,27 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
