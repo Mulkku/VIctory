@@ -198,6 +198,10 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Texture views the shader uses with 64-bit atomics: (root parameter
+    /// index of a table, dword in the table). The host's view there must
+    /// be `R32G32_UINT` or `_SINT`; bind nothing else.
+    pub atomic64_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -622,6 +626,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        atomic64_views: l.atomic64_views,
     })
 }
 
@@ -989,6 +994,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            atomic64_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1000,6 +1006,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                atomic64_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

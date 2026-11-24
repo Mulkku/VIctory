@@ -331,6 +331,16 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        let atomics = stages.iter().any(|(s, _)| {
+            s.translated()
+                .is_some_and(|t| !t.host.atomic64_views.is_empty())
+        });
+        if atomics && !host.typed_atomics_64() {
+            return refuse(
+                "the host GPU has no 64-bit atomics on typed heap views",
+                shaders,
+            );
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();

@@ -43,6 +43,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub atomic64_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -235,6 +236,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Table entries used with 64-bit atomics (see `HostShader`).
+    atomic64_views: Vec<(u8, u32)>,
     /// SGPR spills through VGPR lanes, left out ([`crate::ir::spill_traffic`]).
     spills: HashSet<(usize, usize)>,
 }
@@ -767,6 +770,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            atomic64_views: Vec::new(),
             spills,
         }
     }
@@ -1224,6 +1228,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            atomic64_views: self.atomic64_views,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6323,6 +6328,26 @@ impl<'a> Lower<'a> {
                 return Err("image atomic data");
             };
             let vals = self.vgprs(inst, data, if cmpswap { 2 * n } else { n })?;
+            if wide {
+                // The host checks (or remakes) the view at this table entry,
+                // so it must be one fixed entry.
+                let entry = match src {
+                    Source::Loaded { load, first } => self
+                        .scalar
+                        .get(load)
+                        .filter(|a| a.dynamic.is_none())
+                        .and_then(|a| {
+                            let rp = self.x.native.layout.get(a.param)?;
+                            (rp.root == RootType::Table)
+                                .then_some((rp.slot, a.offset / 4 + u32::from(*first)))
+                        }),
+                    _ => None,
+                };
+                let entry = entry.ok_or("a 64-bit image atomic on a computed descriptor")?;
+                if !self.atomic64_views.contains(&entry) {
+                    self.atomic64_views.push(entry);
+                }
+            }
             let (ty, suffix) = if wide {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
                 (self.s.m.int(64), "i64")
