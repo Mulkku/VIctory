@@ -6,12 +6,12 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{DeclaredView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -37,6 +37,7 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub views: Vec<DeclaredView>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -155,6 +156,8 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Views read at a fixed table or heap position, as declared.
+    views: BTreeSet<DeclaredView>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -460,6 +463,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            views: BTreeSet::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -890,6 +894,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            views: self.views.into_iter().collect(),
         })
     }
 
@@ -3216,6 +3221,9 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                if !sampler {
+                    self.declare(*load, *first, props);
+                }
                 let h = self.s.heap_handle(self.cur, index, sampler, props);
                 self.handles.insert(key, h);
                 Ok(h)
@@ -3279,6 +3287,9 @@ impl<'a> Lower<'a> {
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
                     let index = self.heap_index(*load, *first, sampler);
+                    if !sampler {
+                        self.declare(*load, *first, props);
+                    }
                     self.cur = here;
                     incoming.push((index?, at));
                 }
@@ -3287,6 +3298,33 @@ impl<'a> Lower<'a> {
                 self.s.m.set_phi(phi, incoming);
                 Ok(self.s.heap_handle(self.cur, phi, sampler, props))
             }
+        }
+    }
+
+    /// Records the view kind `props` declares for the descriptor at dword
+    /// `first` of what the scalar load at `load` reads, when that is a
+    /// fixed position in a table or the resource heap.
+    fn declare(&mut self, load: Site, first: u8, props: (u32, u32)) {
+        let Some(a) = self.scalar.get(&load) else {
+            return;
+        };
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return;
+        };
+        let slot = match rp.root {
+            RootType::Table => Some(rp.slot),
+            RootType::ResourceHeap => None,
+            _ => return,
+        };
+        if a.dynamic.is_some() {
+            return;
+        }
+        if let Some(view) = DeclaredView::from_props(
+            slot,
+            a.offset.wrapping_add(4 * u32::from(first)) >> 5,
+            props,
+        ) {
+            self.views.insert(view);
         }
     }
 

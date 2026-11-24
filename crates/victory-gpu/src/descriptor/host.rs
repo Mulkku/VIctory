@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use victory_shader::emit::{DeclaredView, ViewKind};
+
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -736,14 +738,16 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// cannot make: unordered access or a shader view, of a buffer or of the
+/// title's texture dimension. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-        View::Placed(true, resource, _) => resource[0] == 1,
+    let dimension = match view {
+        View::Unordered(r, _, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 1,
+        View::Unordered(_, _, desc) => desc.map_or(0, |d| d[1]),
+        View::Placed(true, resource, _) if resource[0] == 1 => 1,
+        View::Placed(true, _, desc) => desc[1],
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -752,6 +756,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_buffer_view(at);
         }
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
+        // A texture view of no resource reads zeros on the console through
+        // any instruction: shaders computing heap indices read such slots
+        // as 2D textures, and tables whose shader declares another kind get
+        // a null view of that kind per draw (`declares`).
+        View::Shader(0, Some(_)) => return null_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
@@ -765,15 +774,79 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    null_unordered(dimension, D3D12_BUFFER_UAV_FLAG_NONE, 0, at);
+}
+
+/// Unordered access to nothing: a buffer (`dimension` 1, typed unless
+/// `flags` make it raw or `stride` structured) or a texture of that UAV
+/// dimension (2D if it names none).
+fn null_unordered(
+    dimension: u32,
+    flags: D3D12_BUFFER_UAV_FLAGS,
+    stride: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let Some(host) = host() else { return };
+    let dimension = if (1..=8).contains(&dimension) {
+        dimension
+    } else {
+        4
+    };
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
-        },
+        ViewDimension: D3D12_UAV_DIMENSION(dimension as i32),
         ..Default::default()
     };
+    // One slice: fields a null view still checks.
+    match dimension {
+        1 if flags == D3D12_BUFFER_UAV_FLAG_RAW => {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: flags,
+                ..Default::default()
+            };
+        }
+        1 if stride > 0 => {
+            desc.Format = DXGI_FORMAT_UNKNOWN;
+            desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
+                NumElements: 1,
+                StructureByteStride: stride,
+                ..Default::default()
+            };
+        }
+        1 => {
+            desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
+                NumElements: 1,
+                ..Default::default()
+            };
+        }
+        3 => {
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        5 => {
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        7 => {
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        8 => {
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: 1,
+                ..Default::default()
+            };
+        }
+        _ => {}
+    }
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(
@@ -782,6 +855,112 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             Some(&desc),
             at,
         )
+    };
+}
+
+/// Whether the view the host makes for the title's `view` (or the null
+/// view it puts in its place; `None`: no view recorded) has the dimension
+/// and access `declared` says. Constant buffers never do; samplers are
+/// not checked.
+pub(crate) fn declares(view: Option<&View>, declared: &DeclaredView) -> bool {
+    let dimension = |r: usize, desc: Option<&[u32; 10]>| match desc {
+        Some(d) if d[1] != 0 => d[1],
+        _ if crate::resource::buffer_bytes(r as crate::object::This).is_some() => 1,
+        _ => crate::resource::host_resource(r as crate::object::This)
+            .map_or(4, |t| u32::from(default_dimension(t))),
+    };
+    let made = match view {
+        None => (false, 4),
+        // Null texture views are made 2D (`null_for`).
+        Some(View::Shader(0, Some(d))) if d[1] != 1 => (false, 4),
+        Some(View::Shader(r, desc)) => (false, dimension(*r, desc.as_ref())),
+        Some(View::Unordered(r, _, desc)) => (true, dimension(*r, desc.as_ref())),
+        Some(View::Placed(u, resource, _)) if resource[0] == 1 => (*u, 1),
+        Some(View::Placed(u, _, desc)) => (*u, desc[1]),
+        Some(View::Constant(..)) => return false,
+        Some(_) => return true,
+    };
+    made == (declared.uav, u32::from(declared.kind.dimension()))
+}
+
+/// The view dimension a view without a description of `texture` has.
+fn default_dimension(texture: &ID3D12Resource) -> u8 {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let array = d.DepthOrArraySize > 1;
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array => 3,
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => 2,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            if array {
+                7
+            } else {
+                6
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if array => 5,
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => 8,
+        D3D12_RESOURCE_DIMENSION_BUFFER => 1,
+        _ => 4,
+    }
+}
+
+impl HostHeap {
+    /// Makes slot `index` (a dynamic one) a null view of the kind a shader
+    /// declares there.
+    pub(crate) fn make_declared_null(&self, index: u32, declared: &DeclaredView) {
+        let at = self.cpu(index);
+        let dimension = u32::from(declared.kind.dimension());
+        let (flags, stride) = match declared.kind {
+            ViewKind::Raw => (true, 0),
+            ViewKind::Structured(stride) => (false, stride),
+            _ => (false, 0),
+        };
+        if declared.uav {
+            let flags = if flags {
+                D3D12_BUFFER_UAV_FLAG_RAW
+            } else {
+                D3D12_BUFFER_UAV_FLAG_NONE
+            };
+            null_unordered(dimension, flags, stride, at);
+        } else if dimension != 1 {
+            let mut words = [0; 10];
+            words[1] = dimension;
+            null_like(&words, at);
+        } else {
+            null_buffer(flags, stride, at);
+        }
+        self.keep(index, None);
+    }
+}
+
+/// A buffer shader view that reads zeros: raw, structured (`stride`), or
+/// typed (four 32-bit floats).
+fn null_buffer(raw: bool, stride: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if raw {
+        return null_buffer_view(at);
+    }
+    let Some(host) = host() else { return };
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: if stride > 0 {
+            DXGI_FORMAT_UNKNOWN
+        } else {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        },
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                NumElements: 1,
+                StructureByteStride: stride,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
 
@@ -877,5 +1056,47 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// Which title views the host's view (or null view) matches a shader's
+    /// declaration for: by dimension and access.
+    #[test]
+    fn declared_kinds_match_by_dimension_and_access() {
+        let declared = |kind, uav| DeclaredView {
+            slot: Some(0),
+            index: 0,
+            kind,
+            uav,
+        };
+        let tex2d = declared(ViewKind::Texture(4), false);
+        let raw = declared(ViewKind::Raw, false);
+        let raw_uav = declared(ViewKind::Raw, true);
+        // A shader view of a 1D texture of no resource is made a 2D null
+        // view: it fits 2D readers, not 1D ones.
+        let mut desc = [0; 10];
+        desc[1] = 2;
+        let null_1d = View::Shader(0, Some(desc));
+        assert!(declares(Some(&null_1d), &tex2d));
+        let tex1d = declared(ViewKind::Texture(2), false);
+        assert!(!declares(Some(&null_1d), &tex1d));
+        desc[1] = 4;
+        assert!(declares(Some(&View::Shader(0, Some(desc))), &tex2d));
+        // A null buffer view (#57): a buffer, whatever its kind.
+        desc[1] = 1;
+        assert!(declares(Some(&View::Shader(0, Some(desc))), &raw));
+        assert!(!declares(Some(&View::Shader(0, Some(desc))), &tex2d));
+        // Placed buffers by their resource; access must match.
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        let (placed_uav, placed_srv) = (
+            View::Placed(true, resource, [0; 16]),
+            View::Placed(false, resource, [0; 16]),
+        );
+        assert!(declares(Some(&placed_uav), &raw_uav));
+        assert!(!declares(Some(&placed_srv), &raw_uav));
+        // No view: the 2D null view every slot starts with.
+        assert!(declares(None, &tex2d));
+        assert!(!declares(None, &raw));
+        assert!(!declares(Some(&View::Constant(0x1000, 256)), &raw));
     }
 }
