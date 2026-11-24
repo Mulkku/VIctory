@@ -21,6 +21,8 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// A sum of the low halves as f16.
+    AddF16,
     MinU,
     MaxU,
     MinI,
@@ -37,6 +39,7 @@ impl Op {
         Some(match name {
             "v_add_nc_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddF16,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -55,6 +58,8 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            // The low half only: the high half of a sum is not modelled.
+            Op::AddF16 => k & 0x7FFF == 0,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -65,7 +70,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddF16 | Op::Xor)
     }
 }
 
@@ -271,12 +276,47 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = exec & 0xFFFF_FFFF | k << 32;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            // A plain move: each dword holds what its source did.
+            let dwords = match name {
+                "s_mov_b32" => 1,
+                "s_mov_b64" => 2,
+                _ => 0,
+            };
+            if let (Some(Operand::Scalar { code: d, .. }), Some(&s)) = (dst, src.first()) {
+                for h in 0..dwords {
+                    let Some(w) = inst.write(Reg::S(d + h)) else {
+                        continue;
+                    };
+                    let x = match s {
+                        Operand::Scalar { code, .. } if code != NULL => {
+                            match inst.read(Reg::S(code + h)) {
+                                Some(x) => {
+                                    if masked.contains(&x) {
+                                        masked.push(w);
+                                    }
+                                    uni.get(&x).copied().unwrap_or(Sym::Uni(x))
+                                }
+                                None => Sym::Unknown,
+                            }
+                        }
+                        // 64-bit inline constants sign-extend; literals do not.
+                        Operand::Const(c) => match crate::resource::inline(c) {
+                            Some(k) if h == 0 => Sym::K(k),
+                            Some(k) => Sym::K(if (k as i32) < 0 { u32::MAX } else { 0 }),
+                            None => Sym::Unknown,
+                        },
+                        Operand::Literal(k) => Sym::K(if h == 0 { k } else { 0 }),
+                        _ => Sym::Unknown,
+                    };
+                    uni.insert(w, x);
+                }
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -311,7 +351,13 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 _ => one(Sym::Unknown),
             }
         };
-        let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        // Op-sel picks the high halves of 16-bit operands.
+        let modifiers = v.abs != 0
+            || v.neg != 0
+            || v.clamp
+            || v.omod != 0
+            || v.opsel != 0 && name.ends_with("_f16")
+            || v.sdwa.is_some();
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -618,7 +664,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -675,5 +721,54 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    /// A 32-lane whole-wave section summing v0's low halves as f16 lane by
+    /// lane into v2, read out by lane 0 into s4 and moved to s5.
+    pub(crate) fn f16_sum_section() -> Vec<u32> {
+        let mut words = vec![
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32 v1, 0, v0, s0
+            0x7E04_0280, // v_mov_b32 v2, 0
+        ];
+        for l in 0..32 {
+            words.extend([
+                0xD760_0001,
+                0x101 | (128 + l) << 9, // v_readlane_b32 s1, v1, l
+                0x6404_0401,            // v_add_f16 v2, s1, v2
+            ]);
+        }
+        words.extend([
+            0xD760_0004,
+            0x0001_0102, // v_readlane_b32 s4, v2, 0
+            0xBE85_0304, // s_mov_b32 s5, s4
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+        ]);
+        words
+    }
+
+    #[test]
+    fn f16_sums_and_scalar_moves_are_followed() {
+        let mut words = f16_sum_section();
+        words.push(0xBF81_0000); // s_endpgm
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 16).unwrap();
+        let insts = &p.blocks[0].insts;
+        assert_eq!(insts[4].name(), "v_add_f16");
+        let (v0, s0) = (
+            insts[1].read(Reg::V(0)).unwrap(),
+            insts[0].write(Reg::S(0)).unwrap(),
+        );
+        let section = &sections(&p, 0)[&0];
+        let end = section.end;
+        assert!(insts[end].write(Reg::S(EXEC)).is_some());
+        let sum = Shape::Active(Op::AddF16, v0, s0, 0);
+        let v2 = insts[end - 3].write(Reg::V(2)).unwrap();
+        let s4 = insts[end - 2].write(Reg::S(4)).unwrap();
+        let s5 = insts[end - 1].write(Reg::S(5)).unwrap();
+        assert_eq!(section.shapes.get(&v2), Some(&sum));
+        assert_eq!(section.shapes.get(&s4), Some(&sum));
+        assert_eq!(section.shapes.get(&s5), Some(&sum));
     }
 }

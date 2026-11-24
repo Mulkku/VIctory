@@ -777,13 +777,25 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let half = op == Op::AddF16;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF) || half;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        let arg = if float { self.as_float(x) } else { x };
+        // f16 sums are taken in f32 and rounded once: the console rounds
+        // each 16-bit step, so the last bit may differ.
+        let arg = if half {
+            let m = self.s.m.i32(0xFFFF);
+            let x = self.s.m.bin(c, Bin::And, x, m);
+            self.s
+                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+        } else if float {
+            self.as_float(x)
+        } else {
+            x
+        };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU | Op::AddF | Op::AddF16, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
@@ -812,7 +824,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddF16 => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -829,7 +841,16 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        // shortcut: an f16 sum's high half is left zero; the console keeps
+        // whatever the lanes' destination held there.
+        Ok(if half {
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
