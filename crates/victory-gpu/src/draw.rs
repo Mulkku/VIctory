@@ -80,6 +80,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The last bind failed because a table it had to make afresh got no
+    /// dynamic slots (taken by the op that called it, see
+    /// [`State::skipped_for_slots`]).
+    unmade: bool,
 }
 
 impl Drop for State {
@@ -96,6 +100,27 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Ops skipped because a table they read could not be made afresh (no free
+/// dynamic descriptor slots), so far: draws, mesh dispatches, dispatches,
+/// indirect executions. Binding the title's own table offset instead would
+/// have the shader read whatever the host heap holds there.
+static SKIPPED_FOR_SLOTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// What [`SKIPPED_FOR_SLOTS`] counts, by index.
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Draw,
+    Mesh,
+    Dispatch,
+    Indirect,
+}
+
+/// Ops skipped for want of dynamic descriptor slots so far, by kind: draws,
+/// mesh dispatches, dispatches, indirect executions.
+pub(crate) fn skipped_for_slots() -> [u64; 4] {
+    SKIPPED_FOR_SLOTS.each_ref().map(|n| n.load(Ordering::Relaxed))
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -419,11 +444,39 @@ impl State {
         true
     }
 
+    /// Counts an op skipped because its last bind could not make a table
+    /// (no free dynamic slots), and warns once per pipeline; false if the
+    /// bind failed for another reason (or did not fail).
+    fn skipped_for_slots(&mut self, op: Op) -> bool {
+        if !std::mem::take(&mut self.unmade) {
+            return false;
+        }
+        let total = SKIPPED_FOR_SLOTS[op as usize].fetch_add(1, Ordering::Relaxed) + 1;
+        static WARNED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if !warned.contains(&self.pipeline) {
+            warned.push(self.pipeline);
+            drop(warned);
+            let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                ?op,
+                pipeline = %name,
+                skipped = total,
+                "skipped: no free dynamic descriptor slots for a table it reads (warned once per pipeline)"
+            );
+        }
+        true
+    }
+
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold. False if the draw or dispatch must not
-    /// run (a view 64-bit atomics cannot use).
+    /// run (a view 64-bit atomics cannot use, or a table that has to be made
+    /// afresh and gets no dynamic slots: then `unmade` is set).
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.unmade = false;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -472,7 +525,10 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, &t.host.views, compute);
+            let Some(made) = self.tables(list, &t.used, &t.host.views, compute) else {
+                self.unmade = true;
+                return false;
+            };
             if !self.atomic64_views(list, t, &made, compute) {
                 return false;
             }
@@ -562,6 +618,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
+            self.skipped_for_slots(Op::Dispatch);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -627,6 +684,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
+            self.skipped_for_slots(Op::Mesh);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -771,8 +829,10 @@ impl State {
     /// (or access) than the shader declares there (`views`), with a null
     /// view of the declared kind in its place: the console reads any null
     /// descriptor as zeros, the host's views must match. Returns those
-    /// tables' new byte offsets by root parameter; the other tables' slots
-    /// are made from the title's.
+    /// tables' new byte offsets by root parameter (the other tables' slots
+    /// are made from the title's), or `None` if one of them gets no dynamic
+    /// slots: the op must not run then, its shader would read the title's
+    /// slots, which hold other views or none.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
@@ -784,7 +844,7 @@ impl State {
         used: &[UsedResource],
         views: &[DeclaredView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -895,9 +955,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                continue;
-            };
+            let first = host.dynamic(n)?;
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -942,7 +1000,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -1040,6 +1098,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
+            self.skipped_for_slots(Op::Draw);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -1127,6 +1186,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
+            self.skipped_for_slots(Op::Draw);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
@@ -1199,15 +1259,13 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
         };
         if !ran {
+            self.skipped_for_slots(Op::Indirect);
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -1424,4 +1482,208 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::host::Stage;
+    use victory_shader::HwStage;
+    use victory_shader::emit::HostShader;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    /// Bytecode of `source` (with its root signature inside) for `target`.
+    fn compile(source: &str, target: windows::core::PCSTR) -> Vec<u8> {
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                s!("main"),
+                target,
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the system compiler takes the test shader");
+        let code = code.expect("bytecode");
+        // SAFETY: the blob's own bytes.
+        unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) }
+            .to_vec()
+    }
+
+    /// A host pipeline whose one stage reads a constant buffer through the
+    /// table at root parameter 0 (so its draws make that table afresh).
+    fn pipeline(compute: bool, mesh: bool) -> This {
+        let device = &crate::host::host().unwrap().device;
+        let stage = |hw| {
+            let translated = crate::pipeline::Translated {
+                host: HostShader {
+                    stage: hw,
+                    dxil: Vec::new(),
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    atomic64_views: Vec::new(),
+                    views: Vec::new(),
+                },
+                used: vec![UsedResource {
+                    kind: ResourceType::Cbv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+            };
+            Stage {
+                shader: crate::pipeline::test_shader("test", translated),
+                user_data: None,
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+            }
+        };
+        // SAFETY: valid descriptions; the bytecode outlives the calls.
+        let (root, pso) = unsafe {
+            if compute {
+                let cs = compile(
+                    "[RootSignature(\"\")] [numthreads(1, 1, 1)] void main() {}",
+                    s!("cs_5_1"),
+                );
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs).unwrap();
+                let pso: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: cs.as_ptr().cast(),
+                            BytecodeLength: cs.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            } else {
+                let vs = compile(
+                    "[RootSignature(\"\")] float4 main() : SV_Position { return 0; }",
+                    s!("vs_5_1"),
+                );
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
+                let pso: ID3D12PipelineState = device
+                    .CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        VS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: vs.as_ptr().cast(),
+                            BytecodeLength: vs.len(),
+                        },
+                        SampleMask: u32::MAX,
+                        RasterizerState: D3D12_RASTERIZER_DESC {
+                            FillMode: D3D12_FILL_MODE_SOLID,
+                            CullMode: D3D12_CULL_MODE_NONE,
+                            DepthClipEnable: true.into(),
+                            ..Default::default()
+                        },
+                        DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                            DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                            ..Default::default()
+                        },
+                        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let stages = if compute {
+            vec![stage(HwStage::Cs)]
+        } else {
+            vec![stage(if mesh { HwStage::Ms } else { HwStage::Vs })]
+        };
+        crate::pipeline::test_pipeline(HostPipeline {
+            compute,
+            mesh,
+            pso,
+            root,
+            stages,
+            slots: 0,
+            inputs: Vec::new(),
+            name: "test".into(),
+        })
+    }
+
+    /// With no free dynamic slots, every op whose shader reads a table that
+    /// must be made afresh is skipped and counted, never run with the
+    /// title's table offset; with slots free again the same ops run.
+    #[test]
+    fn ops_whose_tables_get_no_slots_are_skipped_until_slots_are_free() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = crate::descriptor::test_view_heap(16);
+        let title = crate::descriptor::heap(heap);
+        let pool = title.host().expect("a host heap");
+        let list = host.new_list().expect("a host list");
+        let state = |pipeline: This| {
+            let mut s = State::default();
+            s.pipeline = pipeline as usize;
+            s.heaps[0] = heap as usize;
+            s.graphics = vec![Root::Table(title.start)];
+            s.compute = vec![Root::Table(title.start)];
+            s
+        };
+        let mut graphics = state(pipeline(false, false));
+        let mut mesh = state(pipeline(false, true));
+        let mut compute = state(pipeline(true, false));
+        // Draw and dispatch arguments, zero: in title memory the host copies.
+        let arguments: &'static [u32; 64] = Box::leak(Box::new([0; 64]));
+        let at = arguments.as_ptr() as u64;
+        crate::shadow::register(arguments.as_ptr() as usize, at, 256);
+
+        let mut taken = Vec::new();
+        for n in [1024, 1] {
+            while let Some(first) = pool.dynamic(n) {
+                taken.push((first, n));
+            }
+        }
+        let (skipped, drawn0, dispatched0) = (skipped_for_slots(), drawn(), dispatched());
+        graphics.draw(&list, 3, 1, 0, 0);
+        mesh.dispatch_mesh(&list, 1);
+        compute.dispatch(&list, 1, 1, 1);
+        assert!(!graphics.execute_indirect(&list, (0, 16, 1), at, None));
+        assert!(!compute.execute_indirect(&list, (2, 12, 1), at, None));
+        let now = skipped_for_slots();
+        let delta: Vec<u64> = now.iter().zip(skipped).map(|(a, b)| a - b).collect();
+        assert_eq!(delta, [1, 1, 1, 2], "draw, mesh, dispatch, indirect skipped");
+        assert_eq!((drawn(), dispatched()), (drawn0, dispatched0), "nothing recorded");
+
+        for (first, n) in taken {
+            pool.release(first, n);
+        }
+        graphics.draw(&list, 3, 1, 0, 0);
+        compute.dispatch(&list, 1, 1, 1);
+        assert!(graphics.execute_indirect(&list, (0, 16, 1), at, None));
+        assert!(compute.execute_indirect(&list, (2, 12, 1), at, None));
+        // A mesh dispatch is bound but not recorded here: the test's mesh
+        // pipeline is a vertex one.
+        assert!(mesh.prepare_for(&list, false, true));
+        assert_eq!(skipped_for_slots(), now, "none skipped");
+        assert!(drawn() >= drawn0 + 2 && dispatched() >= dispatched0 + 2, "recorded again");
+    }
 }

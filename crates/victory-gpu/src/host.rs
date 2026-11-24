@@ -1739,12 +1739,21 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            // Ops skipped for want of dynamic descriptor slots (counted in
+            // the drops above where they are draws), only once there are.
+            let skipped = match crate::draw::skipped_for_slots() {
+                [0, 0, 0, 0] => String::new(),
+                [d, m, x, i] => format!(
+                    "; skipped without descriptor slots so far: {d} draws, {m} mesh, \
+                     {x} dispatches, {i} indirect"
+                ),
+            };
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect",
+                 {indirect:.0} indirect{skipped}",
                 making = crate::pipeline::making()
             );
             #[cfg(feature = "diagnostics")]

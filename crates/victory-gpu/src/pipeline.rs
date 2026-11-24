@@ -320,6 +320,30 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// Tests: a shader whose translation is `translated` (no container).
+#[cfg(all(test, windows))]
+pub(crate) fn test_shader(stage: &'static str, translated: Translated) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: "test".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(translated)),
+    })
+}
+
+/// Tests: a title pipeline whose host pipeline is `host`, made already.
+#[cfg(all(test, windows))]
+pub(crate) fn test_pipeline(host: host::HostPipeline) -> This {
+    let pipeline = Box::new(Pipeline {
+        object: Object::new(&FUNCTIONS),
+        packet: [0; 8],
+        host: Arc::new(make::Pending::made(host)),
+        shaders: Vec::new(),
+        bound: std::sync::atomic::AtomicBool::new(false),
+    });
+    Box::into_raw(pipeline).cast_const().cast()
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,

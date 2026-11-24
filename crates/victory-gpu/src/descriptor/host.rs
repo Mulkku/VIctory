@@ -64,8 +64,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+/// took until it is reset (its submissions have run) or released, and a
+/// frame's lists are all recorded before they run: the world's first frames
+/// hold more than 65,536 (measured on WARP, and refused 96,656 more).
+const DYNAMIC: u32 = 1 << 18;
+
+/// The dynamic slots of a view heap the host refuses with [`DYNAMIC`].
+const DYNAMIC_FALLBACK: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -87,8 +92,20 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
+        let mut extra = if sampler { 0 } else { DYNAMIC };
+        let made = match make(count + extra) {
+            Err(e) if extra > DYNAMIC_FALLBACK => {
+                tracing::warn!(
+                    error = %e,
+                    count,
+                    "host view heap refused with {DYNAMIC} dynamic slots; made with {DYNAMIC_FALLBACK}"
+                );
+                extra = DYNAMIC_FALLBACK;
+                make(count + extra)
+            }
+            made => made,
+        };
+        let (heap, count) = match made {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
@@ -125,7 +142,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -204,14 +221,14 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > DYNAMIC {
+        if self.sampler || n == 0 {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
-        let n = n as usize;
+        let (n, size) = (n as usize, taken.len());
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
+        let starts = (*next as usize..size).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -230,12 +247,12 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made, its draws are skipped")
             });
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % size) as u32;
         Some(self.count + first as u32)
     }
 
@@ -254,8 +271,9 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(DYNAMIC) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        let slots = &mut guard.1;
+        let end = (at as usize + n as usize).min(slots.len());
+        if let Some(slots) = slots.get_mut(at as usize..end) {
             slots.fill(false);
         }
     }
@@ -1213,6 +1231,18 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// The host takes a view heap with the title's slots and all
+    /// [`DYNAMIC`] dynamic ones (not the fallback size).
+    #[test]
+    fn view_heaps_have_every_dynamic_slot() {
+        let Some(heap) = HostHeap::new(false, 1_245_184) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), 1_245_184);
+        assert_eq!(heap.dynamic(DYNAMIC), Some(1_245_184));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     /// A 4x4 texture with unordered access, in GPU memory.
