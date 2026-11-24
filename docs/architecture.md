@@ -89,7 +89,11 @@ lanes (`v_writelane_b32`, `v_readlane_b32`) are forwarded, so a lane mask
 keeps its meaning across a spill. `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::resource`
+a lane can reach them with its EXEC bit clear. A scalar register is the
+wave's: where it joins a lane mask with data after a divergent branch,
+compute code gives every lane the value of the side the console's wave
+ran (the side some lane takes, when every such lane comes to the join
+from it); other such joins are refused. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and

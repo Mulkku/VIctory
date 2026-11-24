@@ -31,6 +31,15 @@ struct Tally {
     opaque: usize,
     lane_branches: usize,
     uniform_branches: usize,
+    /// Data joins with a lane mask on some edge: edges no lane reading
+    /// the join comes over, and joins some such lane reads.
+    dead_mask_edges: usize,
+    live_mask_joins: usize,
+    /// Those in compute programs, and the ones of them whose wave-wide
+    /// value is known (`WaveJoin`), with uniform branches among them.
+    cs_mask_joins: usize,
+    cs_wave_joins: usize,
+    cs_uniform_joins: usize,
     tracked: usize,
     loaded: usize,
     built: usize,
@@ -102,6 +111,11 @@ impl Tally {
         self.opaque += other.opaque;
         self.lane_branches += other.lane_branches;
         self.uniform_branches += other.uniform_branches;
+        self.dead_mask_edges += other.dead_mask_edges;
+        self.live_mask_joins += other.live_mask_joins;
+        self.cs_mask_joins += other.cs_mask_joins;
+        self.cs_wave_joins += other.cs_wave_joins;
+        self.cs_uniform_joins += other.cs_uniform_joins;
         self.tracked += other.tracked;
         self.loaded += other.loaded;
         self.built += other.built;
@@ -242,6 +256,16 @@ pub fn run(
         t.uniform_branches
     );
     println!(
+        "mask joins   {} read ({} edges proven dead); compute {}: {} exact ({} uniform), \
+         {} refused",
+        t.live_mask_joins,
+        t.dead_mask_edges,
+        t.cs_mask_joins,
+        t.cs_wave_joins,
+        t.cs_uniform_joins,
+        t.cs_mask_joins - t.cs_wave_joins
+    );
+    println!(
         "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
          {} scalar accesses; {} with a computed term)",
         t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
@@ -370,7 +394,7 @@ fn translate(
                 }
                 let structured = match structure::structure(&program) {
                     Ok(s) => {
-                        tally_structured(&program, &s, t);
+                        tally_structured(&program, &s, compute, t);
                         Some(s)
                     }
                     Err(e) => {
@@ -628,8 +652,24 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     t.unlisted += traced.difference(&listed).count();
 }
 
-fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Tally) {
+fn tally_structured(
+    program: &ir::Program,
+    s: &structure::Structured,
+    compute: bool,
+    t: &mut Tally,
+) {
     t.structured += 1;
+    t.dead_mask_edges += s.dead_mask_edges.len();
+    t.live_mask_joins += s.live_mask_joins;
+    if compute {
+        t.cs_mask_joins += s.live_mask_joins;
+        t.cs_wave_joins += s.wave_joins.len();
+        t.cs_uniform_joins += s
+            .wave_joins
+            .values()
+            .filter(|&&w| w == structure::WaveJoin::Uniform)
+            .count();
+    }
     for (block, guards) in program.blocks.iter().zip(&s.guards) {
         t.vector += block
             .insts

@@ -10,7 +10,9 @@
 //! can decide alone. A register holding a mask on one path and a loaded
 //! value on another is data where the paths join; the mask needs no value
 //! as data only where no lane bringing it can reach a read of the join
-//! ([`Structured::dead_mask_edges`]). A path-sensitive
+//! ([`Structured::dead_mask_edges`]); where lanes from both sides read
+//! it, the wave's single value is the side the wave ran last
+//! ([`WaveJoin`]). A path-sensitive
 //! pass then proves, for each vector instruction, that EXEC holds in every
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
@@ -325,6 +327,35 @@ pub struct Structured {
     pub dead_mask_edges: HashSet<(Value, usize)>,
     /// Such edges where a lane coming in may read the join.
     pub live_mask_edges: usize,
+    /// Joins with such an edge.
+    pub live_mask_joins: usize,
+    /// Joins with such live edges whose wave-wide value the lanes coming in
+    /// can still agree on (see [`WaveJoin`]), by the join's value.
+    pub wave_joins: HashMap<Value, WaveJoin>,
+    /// SCC values known in a block, by block and value: SCC of the EXEC
+    /// write that a closing `s_cbranch_execz`/`execnz` tests is "some lane
+    /// is left", so it is clear wherever the wave went because none was
+    /// (a loop's exit) and set on the other edge. Only blocks entered from
+    /// that edge alone are listed. `s_cselect` there picks its operand,
+    /// lane masks included.
+    pub exit_scc: HashMap<(usize, Value), bool>,
+}
+
+/// How the console's single value of a register joined with a lane mask
+/// on some edges and data on others comes about, where lanes from more
+/// than one edge read it. On the console a scalar register is the wave's:
+/// after a divergent branch it holds what the side the wave ran last left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveJoin {
+    /// The branch the sides part at is uniform: every lane of the wave
+    /// comes in on the same edge, so each lane's own value is the wave's.
+    Uniform,
+    /// The wave runs the side entered over the predecessor at this index
+    /// whenever some lane takes it (and then the other side's value is
+    /// gone, or that side never ran); otherwise the other side's value
+    /// stands. Every lane taking that side reaches the join over that
+    /// edge, so "some lane came in over it" is the wave's choice.
+    AnyLane(usize),
 }
 
 /// Builds the per-lane form of `program`.
@@ -348,6 +379,10 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// Immediate dominator per block ([`crate::ir::idoms`]).
+    idom: Vec<usize>,
+    /// See [`Structured::exit_scc`].
+    exit_scc: HashMap<(usize, Value), bool>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -373,6 +408,8 @@ struct Lanes<'a> {
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
+    /// Per block: EXEC at its end, where the block reads or writes it.
+    exec_end: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
     /// Masks reaching a join ([`Atom::Phi`]) over back edges, still to find.
@@ -387,6 +424,16 @@ struct Join {
     id: Value,
     value: bool,
     args: Vec<Key>,
+}
+
+/// Data joins with a lane mask on some edges (see
+/// [`Structured::dead_mask_edges`] and the fields after it).
+#[derive(Default)]
+struct Reused {
+    dead: HashSet<(Value, usize)>,
+    live_edges: usize,
+    live_joins: usize,
+    waves: HashMap<Value, WaveJoin>,
 }
 
 struct SopMasks {
@@ -424,8 +471,11 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        Ok(Lanes {
+        let idom = crate::ir::idoms(blocks, &order, &index);
+        let mut lanes = Lanes {
             p,
+            idom,
+            exit_scc: HashMap::new(),
             order,
             index,
             incoming,
@@ -439,9 +489,12 @@ impl<'a> Lanes<'a> {
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
+            exec_end: vec![None; blocks.len()],
             active: HashSet::new(),
             back_edge_masks: Vec::new(),
-        })
+        };
+        lanes.exit_scc = lanes.find_exit_scc();
+        Ok(lanes)
     }
 
     fn reset(&mut self) {
@@ -452,6 +505,7 @@ impl<'a> Lanes<'a> {
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
+        self.exec_end.fill(None);
         self.active.clear();
         self.back_edge_masks.clear();
     }
@@ -502,6 +556,7 @@ impl<'a> Lanes<'a> {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
+            self.exec_end[b] = now;
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
@@ -593,7 +648,8 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
-        let (dead_mask_edges, live_mask_edges) = self.reused_mask_edges(cond);
+        let idom = std::mem::take(&mut self.idom);
+        let reused = self.reused_mask_edges(cond, &idom);
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -609,16 +665,86 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
-            dead_mask_edges,
-            live_mask_edges,
+            dead_mask_edges: reused.dead,
+            live_mask_edges: reused.live_edges,
+            live_mask_joins: reused.live_joins,
+            wave_joins: reused.waves,
+            exit_scc: self.exit_scc,
         })
+    }
+
+    /// See [`Structured::exit_scc`].
+    fn find_exit_scc(&self) -> HashMap<(usize, Value), bool> {
+        let idom = &self.idom;
+        let p = self.p;
+        let mut known = HashMap::new();
+        for (q, block) in p.blocks.iter().enumerate() {
+            let Exit::Branch { taken, not_taken } = block.exit else {
+                continue;
+            };
+            let Some(branch) = block.insts.last() else {
+                continue;
+            };
+            // The successor the wave goes to with no lane left.
+            let none = match branch.name() {
+                "s_cbranch_execnz" => not_taken,
+                "s_cbranch_execz" => taken,
+                _ => continue,
+            };
+            let Some(tested) = self.key(|r| branch.read(r), EXEC) else {
+                continue;
+            };
+            // The instruction writing the tested EXEC, with SCC "result is
+            // not zero": a bitwise operation (saving EXEC or not).
+            let Some(scc) = block.insts.iter().rev().find_map(|i| {
+                let name = i.name().strip_prefix("s_")?;
+                let op = name
+                    .strip_suffix("_b64")
+                    .or_else(|| name.strip_suffix("_b32"))?;
+                let op = op
+                    .strip_suffix("_saveexec")
+                    .or_else(|| op.strip_suffix("_wrexec"))
+                    .unwrap_or(op);
+                let bitwise = matches!(
+                    op,
+                    "and"
+                        | "or"
+                        | "xor"
+                        | "andn2"
+                        | "orn2"
+                        | "andn1"
+                        | "orn1"
+                        | "nand"
+                        | "nor"
+                        | "xnor"
+                        | "not"
+                );
+                (bitwise && self.key(|r| i.write(r), EXEC) == Some(tested))
+                    .then(|| i.write(Reg::Scc))
+                    .flatten()
+            }) else {
+                continue;
+            };
+            for (to, value) in [(none, false), (taken ^ not_taken ^ none, true)] {
+                // Entered from this edge alone: the blocks it dominates.
+                if taken == not_taken || to == q || p.blocks[to].preds != [q] {
+                    continue;
+                }
+                for x in 0..p.blocks.len() {
+                    if dominated(idom, x, to) {
+                        known.insert((x, scc), value);
+                    }
+                }
+            }
+        }
+        known
     }
 
     /// See [`Structured::dead_mask_edges`]: a join of data with a mask on
     /// an edge, proven dead on that edge when the lanes taking the edge
     /// reach no block that reads the join (an instruction there, or a phi
     /// through the block ending at it).
-    fn reused_mask_edges(&mut self, cond: &[Bool]) -> (HashSet<(Value, usize)>, usize) {
+    fn reused_mask_edges(&mut self, cond: &[Bool], idom: &[usize]) -> Reused {
         let p = self.p;
         let dwords: HashSet<Value> = self.masks.keys().flat_map(|&(lo, hi)| [lo, hi]).collect();
         let mut readers: Map<Value, Vec<usize>> = Map::default();
@@ -634,13 +760,14 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        let (mut dead, mut live) = (HashSet::new(), 0);
+        let mut r = Reused::default();
         for (j, block) in p.blocks.iter().enumerate() {
             for phi in &block.phis {
                 let data = matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1);
                 if !data || dwords.contains(&phi.value) {
                     continue;
                 }
+                let mut read_join = false;
                 for (n, a) in phi.args.iter().enumerate() {
                     if !dwords.contains(a) {
                         continue;
@@ -653,14 +780,104 @@ impl<'a> Lanes<'a> {
                             .any(|&b| reach.as_ref().is_none_or(|r| r[b] != Bool::FALSE))
                     });
                     if read {
-                        live += 1;
+                        r.live_edges += 1;
+                        read_join = true;
                     } else {
-                        dead.insert((phi.value, n));
+                        r.dead.insert((phi.value, n));
+                    }
+                }
+                if read_join {
+                    r.live_joins += 1;
+                    if let Some(w) = self.wave_join(cond, idom, j) {
+                        r.waves.insert(phi.value, w);
                     }
                 }
             }
         }
-        (dead, live)
+        r
+    }
+
+    /// See [`WaveJoin`]: the join at block `j` of the two sides of a branch
+    /// at its immediate dominator, over forward edges. A lane-dependent
+    /// branch sends the wave to one side when some lane of EXEC wants it
+    /// there (`execnz`, `vccnz`, SCC of a mask operation set: the taken
+    /// side; the `z` forms: the side they fall through to). The lanes that
+    /// take that side in the per-lane form are exactly those lanes when
+    /// they all lie in EXEC there (lanes in EXEC reach the branch); every
+    /// lane entering that side must come to `j` from it.
+    fn wave_join(&mut self, cond: &[Bool], idom: &[usize], j: usize) -> Option<WaveJoin> {
+        let p = self.p;
+        let incoming = &self.incoming[j];
+        if incoming.len() != 2
+            || incoming
+                .iter()
+                .any(|&(q, _)| self.index[q] >= self.index[j])
+        {
+            return None;
+        }
+        let (first, second) = (incoming[0], incoming[1]);
+        let d = idom[j];
+        let Exit::Branch { taken, not_taken } = p.blocks[d].exit else {
+            return None;
+        };
+        if taken == not_taken {
+            return None;
+        }
+        // The side of the branch at `d` each edge comes from.
+        let side = |(q, t): (usize, bool)| {
+            if q == d {
+                Some(t)
+            } else if taken != j && dominated(idom, q, taken) {
+                Some(true)
+            } else if not_taken != j && dominated(idom, q, not_taken) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let sides = [side(first)?, side(second)?];
+        if sides[0] == sides[1] {
+            return None;
+        }
+        let when = self.when[d]?;
+        let lane = self.b.given(when, cond[d]);
+        if self
+            .b
+            .support(lane)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_)))
+        {
+            return Some(WaveJoin::Uniform);
+        }
+        let any_taken = match p.blocks[d].insts.last()?.name() {
+            "s_cbranch_execnz" | "s_cbranch_vccnz" | "s_cbranch_scc1" => true,
+            "s_cbranch_execz" | "s_cbranch_vccz" | "s_cbranch_scc0" => false,
+            _ => return None,
+        };
+        let any = if any_taken { when } else { self.b.not(when) };
+        if !self.b.implies(any, self.exec_end[d]?) {
+            return None;
+        }
+        let entry = if any_taken { taken } else { not_taken };
+        if entry != j {
+            for (x, block) in p.blocks.iter().enumerate() {
+                if self.index[x] == usize::MAX || !dominated(idom, x, entry) {
+                    continue;
+                }
+                let leaves = match block.exit {
+                    Exit::End | Exit::Indirect => true,
+                    e => e
+                        .successors()
+                        .iter()
+                        .any(|&s| s != j && !dominated(idom, s, entry)),
+                };
+                if leaves {
+                    return None;
+                }
+            }
+        }
+        let n = sides.iter().position(|&s| s == any_taken)?;
+        Some(WaveJoin::AnyLane(n))
     }
 
     /// What a lane knows in each block it can reach after entering block
@@ -934,9 +1151,16 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                // The block of the select, by a value it writes.
+                let at = inst.writes.first().and_then(|w| self.defs.get(&w.1));
+                match at.and_then(|&(b, _)| self.exit_scc.get(&(b, scc))) {
+                    Some(&known) => (if known { a } else { c }, None),
+                    None => {
+                        let born = self.born(scc);
+                        let u = self.b.atom(Atom::Uniform(scc), born);
+                        (self.b.ite(u, a, c), None)
+                    }
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1173,6 +1397,20 @@ const TOO_LARGE: ShaderError = ShaderError::Isa {
     reason: "lane conditions too large",
 };
 
+/// Whether block `x` is `d` or dominated by it, given immediate dominators
+/// ([`crate::ir::idoms`]; unreachable blocks are dominated by none).
+fn dominated(idom: &[usize], mut x: usize, d: usize) -> bool {
+    loop {
+        if x == d {
+            return true;
+        }
+        match idom[x] {
+            up if up == x || up == usize::MAX => return false,
+            up => x = up,
+        }
+    }
+}
+
 /// `ir::build` splits irreducible loops; checked again because everything
 /// here assumes a reducible graph.
 fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), ShaderError> {
@@ -1401,6 +1639,8 @@ mod tests {
         // Lanes holding the mask read the join right there.
         assert!(s.dead_mask_edges.is_empty());
         assert_eq!(s.live_mask_edges, 1);
+        // Every lane comes in over the same edge: each lane's own value.
+        assert_eq!(s.wave_joins.get(&phi.value), Some(&WaveJoin::Uniform));
     }
 
     #[test]
@@ -1436,5 +1676,100 @@ mod tests {
         // Lanes from the mask's side left on SCC clear, so they skip the read.
         assert_eq!(s.dead_mask_edges, HashSet::from([(phi.value, n)]));
         assert_eq!(s.live_mask_edges, 0);
+    }
+
+    /// `s2` holds the compare mask, then 5 where some lane ran the `if`.
+    fn mask_or_data_after_if(inside: &[u32]) -> Vec<u32> {
+        // s_cbranch_execz -> join
+        let skip = 0xBF88_0000 | (1 + inside.len() as u32);
+        let mut words = vec![
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_036A, // s_mov_b32 s2, vcc_lo
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            skip,
+        ];
+        words.extend(inside);
+        words.extend([
+            0xBE82_0385, // s_mov_b32 s2, 5
+            0x887E_007E, // join: s_or_b32 exec_lo, exec_lo, s0
+            0x7E02_0202, // v_mov_b32 v1, s2
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    fn join_of(p: &Program, reg: Reg) -> (usize, Value) {
+        p.blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                let phi = block.phis.iter().find(|f| f.reg == reg)?;
+                Some((b, phi.value))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_scalar_join_after_an_if_takes_the_side_any_lane_ran() {
+        let p = build(&mask_or_data_after_if(&[]), false);
+        let s = structure(&p).unwrap();
+        let (j, phi) = join_of(&p, Reg::S(2));
+        assert_eq!(s.live_mask_edges, 1);
+        // The wave ran the `if` when some lane of the compare entered it.
+        let inside = p.blocks[j]
+            .preds
+            .iter()
+            .position(|&q| p.blocks[q].offset == 16)
+            .unwrap();
+        assert_eq!(s.wave_joins.get(&phi), Some(&WaveJoin::AnyLane(inside)));
+    }
+
+    #[test]
+    fn a_scalar_join_is_refused_where_lanes_of_a_side_leave() {
+        let p = build(
+            &mask_or_data_after_if(&[
+                0xBF06_8003, // s_cmp_eq_u32 s3, 0
+                0xBF85_0003, // s_cbranch_scc1 -> s_endpgm, past the join's read
+            ]),
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let (_, phi) = join_of(&p, Reg::S(2));
+        assert_eq!(s.live_mask_edges, 1);
+        // The wave may run the `if` with every such lane leaving: refused.
+        assert_eq!(s.wave_joins.get(&phi), None);
+    }
+
+    #[test]
+    fn scc_after_a_loop_on_exec_is_clear() {
+        let p = build(
+            &[
+                0xBE82_0380, // s_mov_b32 s2, 0
+                0x4A00_0081, // 4: v_add_nc_u32 v0, 1, v0
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+                0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+                0xBF89_FFFB, // s_cbranch_execnz -> 4
+                0x8503_8281, // s_cselect_b32 s3, 1, 2
+                0x8504_C16A, // s_cselect_b32 s4, vcc_lo, -1
+                0xD501_0001,
+                0x0011_0280, // v_cndmask_b32 v1, 0, 1, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let (lp, exit) = (1, 2);
+        assert_eq!(p.blocks[exit].preds, [lp]);
+        let scc = p.blocks[lp].insts[3].write(Reg::Scc).unwrap();
+        let select = &p.blocks[exit].insts[0];
+        assert_eq!(select.name(), "s_cselect_b32");
+        assert_eq!(select.read(Reg::Scc), Some(scc));
+        // No lane is left where the wave leaves the loop; one is in it.
+        assert_eq!(s.exit_scc.get(&(exit, scc)), Some(&false));
+        assert_eq!(s.exit_scc.get(&(lp, scc)), None);
+        // A select of masks there takes its second operand.
+        let s4 = p.blocks[exit].insts[1].write(Reg::S(4)).unwrap();
+        assert_eq!(s.masks.get(&s4), Some(&Bool::TRUE));
     }
 }

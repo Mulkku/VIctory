@@ -18,7 +18,7 @@ use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
-use crate::structure::{Atom, Bool, LaneExit, Structured};
+use crate::structure::{Atom, Bool, LaneExit, Structured, WaveJoin};
 
 type Why = &'static str;
 
@@ -145,6 +145,9 @@ struct Lower<'a> {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// Per [`WaveJoin::AnyLane`] join: an i1 phi, its IR block and the
+    /// predecessor index for which it is true.
+    side_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -464,6 +467,7 @@ impl<'a> Lower<'a> {
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
+            side_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -853,6 +857,33 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The wave's value of a scalar join (see [`WaveJoin::AnyLane`]): each
+    /// lane's own `joined` is uniform among the lanes that came in over the
+    /// same edge; when some lane came over predecessor `n`, every lane gets
+    /// that edge's value.
+    fn wave_join(&mut self, joined: V, b: usize, n: usize) -> V {
+        let c = self.cur;
+        let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+        let from = self.s.m.phi(c, i1);
+        self.side_phis.push((from, b, n));
+        self.s.flags |= flags::WAVE_OPS;
+        let any = self
+            .s
+            .op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[from]);
+        let zero = self.s.m.i32(0);
+        let mine = self.s.m.select(c, from, joined, zero);
+        let or = self.s.m.i8(1);
+        let theirs = self.s.op(
+            c,
+            "waveActiveBit.i32",
+            Attr::NoUnwind,
+            i32t,
+            120,
+            &[mine, or],
+        );
+        self.s.m.select(c, any, theirs, joined)
+    }
+
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -907,7 +938,12 @@ impl<'a> Lower<'a> {
                     _ => {
                         let v = self.s.m.phi(self.cur, self.s.t.i32);
                         self.data_phis.push((v, b, i));
-                        Val::I32(v)
+                        match self.x.st.wave_joins.get(&phi.value) {
+                            Some(&WaveJoin::AnyLane(n)) if self.mask_data == MaskData::Console => {
+                                Val::I32(self.wave_join(v, b, n))
+                            }
+                            _ => Val::I32(v),
+                        }
                     }
                 };
                 self.vals.insert(phi.value, val);
@@ -2888,6 +2924,10 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        // "Some lane is left" where the wave went on because none was.
+        if let Some(&k) = self.x.st.exit_scc.get(&(self.cur_ir, v)) {
+            return Ok(self.s.m.bool(k));
+        }
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -7235,25 +7275,43 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let wave = match self.mask_data {
+                MaskData::Console => self.x.st.wave_joins.get(&phi.value).copied(),
+                _ => None,
+            };
+            let any_lane = matches!(wave, Some(WaveJoin::AnyLane(_)));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                let val = self.vals.get(&arg).copied();
+                let dead = self.x.st.dead_mask_edges.contains(&(phi.value, n));
+                let is_mask =
+                    self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg);
+                // A join the wave agrees on (`Structured::wave_joins`): the
+                // mask as data, its ballot.
+                let ballot = match val {
+                    Some(Val::I32(_) | Val::Bit(_)) => None,
+                    _ if wave.is_some() && !bit && is_mask => Some(self.mask_dword(arg)),
+                    _ => None,
+                };
+                let x = match (val, bit, ballot) {
+                    (_, _, Some(Ok(x))) => x,
+                    (Some(Val::I32(x)), false, _) | (Some(Val::Bit(x)), true, _) => x,
+                    (_, _, Some(Err(why)))
+                        if self.read_phis.contains(&phi.value) && (any_lane || !dead) =>
+                    {
+                        return Err(Stop::Retry(phi.value, why));
+                    }
                     // A register the compiler reuses, a lane mask on this
                     // edge and data on another, where no lane coming this
                     // way reads the join (`Structured::dead_mask_edges`).
-                    (Some(Val::Missing(_)), false)
-                        if self.x.st.dead_mask_edges.contains(&(phi.value, n)) =>
-                    {
-                        self.s.m.i32(0)
-                    }
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(_)), false, _) if dead && !any_lane => self.s.m.i32(0),
+                    (Some(Val::Bit(_)), false, _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _, _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
@@ -7263,6 +7321,15 @@ impl<'a> Lower<'a> {
                     _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
+        for (v, b, side) in std::mem::take(&mut self.side_phis) {
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                incoming.push((self.s.m.bool(n == side), qb));
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -7500,6 +7567,53 @@ mod tests {
                 "ds_bpermute_b32"
             ]
         );
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn a_scalar_join_of_a_mask_and_data_takes_the_waves_side() {
+        let mut words = vec![
+            ADDRESS,
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_036A, // s_mov_b32 s2, vcc_lo
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> join
+            0xBE82_0385, // s_mov_b32 s2, 5
+            0x887E_007E, // join: s_or_b32 exec_lo, exec_lo, s0
+            0x7E02_0202, // v_mov_b32 v1, s2
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn scc_after_a_loop_on_exec_selects() {
+        let mut words = vec![
+            ADDRESS,
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x4A00_0081, // v_add_nc_u32 v0, 1, v0
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFB, // s_cbranch_execnz -> v_add_nc_u32
+            0x8503_8281, // s_cselect_b32 s3, 1, 2
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E02_0203, // v_mov_b32 v1, s3
+        ];
+        words.extend(store(1));
+        words.push(S_ENDPGM);
+        translate_compute(&words).unwrap();
+    }
+
+    #[test]
+    fn f16_wave_sums_translate() {
+        let mut words = vec![ADDRESS];
+        words.extend(super::super::wave::tests::f16_sum_section());
+        words.push(0x7E02_0205); // v_mov_b32 v1, s5
+        words.extend(store(1));
+        words.extend(store(2));
+        words.push(S_ENDPGM);
         translate_compute(&words).unwrap();
     }
 }
