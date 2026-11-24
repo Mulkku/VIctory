@@ -24,7 +24,7 @@ flock D:/victory-runs/gpu.lock python tools/vrun.py target/diag/victory.exe --la
 | `--script FILE` | `tools/first-boot.txt` | input script (below) |
 | `--keys S`, `--pad S` | from the script file | `VICTORY_KEYS` / `VICTORY_PAD` given directly |
 | `--settle N` | 30 | frames after a press its effect is looked for |
-| `--stuck-keys N` | 3 | that many presses in a row without a visible effect end the run as stuck |
+| `--stuck-keys N` | 5 | that many menu presses in a row without a visible effect end the run as stuck |
 | `--still S` | 900 | short of the world, no capture changing for that long ends the run as stuck |
 | `--data fresh\|DIR` | `fresh` | empty data folder, or a copy of a saved one (`DIR` is copied, never written) |
 | `--cache DIR` | `D:\victory-runs\cache\<build>` | cache folder; shader entries are keyed by the build anyway |
@@ -66,8 +66,9 @@ count as near-identical (a loading spinner stays within that).
   `--settle` frames after it differ in more cells than the two captures
   before it (the screen's own motion). Frame-timed presses get those three
   captures; second-timed ones use the nearest captures.
-- The run ends as `stuck` when the last `--stuck-keys` presses, made on a
-  screen that is not black, had no visible effect and nothing changed since
+- The run ends as `stuck` when the last `--stuck-keys` presses made in the
+  menus (before the first log rule), on a screen that is not black, had no
+  visible effect and nothing changed since
   the first of them, or when (short of the world) no capture changed for
   `--still` seconds.
 - `menus`: 64 frames presented and a capture that is not black. `loading`:
@@ -79,14 +80,17 @@ count as near-identical (a loading spinner stays within that).
 
 - `stage` (`boot`, `menus`, `loading`, `world`), `stage_reached_at_s`,
   `stage_evidence`, `log_rules_at_s` (when each rule fired, confirmed or not);
-- `end`: `exit` (the title ended; `exit_code`), `crash` (unhandled exception:
-  `crash` holds the exception code, `module+offset` and detail),
-  `device-removed` (host GPU failure: `device_removed_reason`, `dred` with
-  DRED's stopped lists and the draws/dispatches in flight), `stuck`
-  (`stuck_at`: why, the last distinct capture, the presses on that screen
-  without effect), or `timeout`, `world-time`, `hang` (vrun stopped it:
+- `end`: `exit` (the title or VIctory ended it; `exit_code`), `killed` (the
+  process ended with neither's end in the log: from outside), `crash`
+  (unhandled exception: `crash` holds the exception code, `module+offset`
+  and detail), `device-removed` (host GPU failure: `device_removed_reason`,
+  `dred` with DRED's stopped lists and the draws/dispatches in flight),
+  `stuck`, or `timeout`, `world-time`, `hang` (vrun stopped it:
   `stopped_by_harness` is `closed` when the window's close ended the title,
   else `terminated`);
+- `stuck_at` (when the run ended stuck, or its last `--stuck-tail` seconds,
+  default 60, showed one unchanged screen): why, the last distinct capture
+  and its file, the presses on that screen without effect;
 - `seconds`, `seconds_in_world`, `frames_presented` (the log's power-of-two
   lines and the captures), `last_fps`, `black_frames_logged`;
 - `captures`: count, black ones, the last, the last not black, and
@@ -99,12 +103,30 @@ count as near-identical (a loading spinner stays within that).
 - `dropped_draws`, `dropped_dispatches`: issued minus run on the host, summed
   over the log's frame lines (up to `dropped_counted_to_frame`).
 
+### Start states
+
+- `--data fresh`: first boot. `tools/first-boot.txt` presses through the
+  account, setup and legal screens, but the frame each screen appears at
+  varies several-fold between software-adapter runs (a slow boot showed
+  black for 1200 frames instead of 150), so it can fall out of step; vrun
+  then ends the run as `stuck` on the screen it stopped at.
+- `--data D:\victory-runs\snapshots\after-first-boot` (local): a data folder
+  saved after first boot (settings, legal terms accepted, a player save).
+  Only A is needed from there, so a repeated press is reproducible:
+
+```sh
+flock D:/victory-runs/gpu.lock python tools/vrun.py target/diag/victory.exe --label baseline \
+    --data D:/victory-runs/snapshots/after-first-boot --keys "" --pad "f200..f12000/75:A" \
+    --timeout 2700 --world-time 1200
+```
+
 ### Input scripts
 
 `VICTORY_KEYS=<when>:<key>,...` and `VICTORY_PAD=<when>:<button>,...`.
 `<when>` is seconds after input starts (held 0.2 s) or `f<n>`, the n-th
-presented frame (held 4 frames). The software adapter presents at a varying,
-low rate, so frame times are what make a script repeatable. Keys: a letter,
+presented frame (held 4 frames). On the software adapter a 0.2 s hold can
+fall between two frames, so frame times are the safer choice; when a screen
+appears still varies between runs (see Start states). Keys: a letter,
 a digit, `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
 Buttons: `A B X Y Menu View Up Down Left Right LB RB LS RS`, pressed on the
 first pad the title sees (the first host pad, else the keyboard's stand-in).
@@ -114,8 +136,15 @@ out, so only the scripts reach the title, whatever is plugged in or pressed
 meanwhile.
 
 A script file has one press per line, `key <when>:<key>` or
-`pad <when>:<button>`, `#` comments. `tools/first-boot.txt` takes a fresh
-data folder into the world.
+`pad <when>:<button>`, `#` comments. `f<a>..f<b>/<n>:<names>` (in a file or
+on the command line) presses the space-separated names in turn every n
+frames from frame a to b. `tools/first-boot.txt` takes a fresh data folder
+into the world.
+
+A relaunch (the title starting itself again for a new game) inherits the
+environment: the new process counts frames from 1 and replays both scripts,
+and its captures overwrite the old process's files of the same number.
+`summary.json` counts relaunches.
 
 ### Stage rules
 

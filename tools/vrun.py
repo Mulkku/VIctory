@@ -146,6 +146,23 @@ def parse_script(script, names, letters=False):
     return out
 
 
+REPEAT = re.compile(r"f(\d+)\.\.f(\d+)/(\d+):(.+)")
+
+
+def expand(script):
+    """Spells out repeats: `f900..f3000/60:A Down` presses A at frame 900,
+    Down at 960, A at 1020, and so on up to frame 3000."""
+    out = []
+    for entry in filter(None, (e.strip() for e in script.split(","))):
+        if m := REPEAT.fullmatch(entry):
+            start, end, step, names = int(m[1]), int(m[2]), int(m[3]), m[4].split()
+            out += [f"f{n}:{names[i % len(names)]}"
+                    for i, n in enumerate(range(start, end + 1, max(step, 1)))]
+        else:
+            out.append(entry)
+    return ",".join(out)
+
+
 # Captures are compared by a signature: the frame shrunk to GRID cells of
 # grayscale. Cells differing by more than CELL_DIFF count as changed; two
 # captures with at most SAME_CELLS changed cells are near-identical (a
@@ -282,6 +299,7 @@ class Run:
         self.gpu_failure = None
         self.crash = None
         self.stuck_why = None
+        self.ended_itself = False  # the title's own end or VIctory's
         self.lock = threading.Lock()
 
     def elapsed(self):
@@ -319,8 +337,10 @@ class Run:
                         self.frames = n
                         self.last_frame_change = time.monotonic()
             elif "shader does not translate" in record:
-                f = fields(record)
-                self.untranslated[f"{f.get('stage', '?')}: {error_kind(f.get('error', '?'))}"] += 1
+                stage = fields(record).get("stage", "?")
+                # The error is the record's last field and has spaces.
+                error = m.group(1) if (m := re.search(r"\berror=(.*)", record)) else "?"
+                self.untranslated[f"{stage}: {error_kind(error)}"] += 1
             elif m := CRASH.search(record):
                 self.crash = self.crash or {
                     "exception": m.group(1),
@@ -331,6 +351,8 @@ class Run:
                 self.relaunches.append(int(m.group(1)))
             elif "black_frames=" in record:
                 self.black_frames = max(self.black_frames, int(fields(record)["black_frames"]))
+            elif "title exited with" in record or "ending the title" in record:
+                self.ended_itself = True
             elif "GameInputCreate" in record and self.input_t is None:
                 self.input_t = t
             if " ERROR victory_gpu::host:" in record and self.gpu_failure is None:
@@ -398,18 +420,22 @@ class Run:
             ambient = compare(pre["sig"], before["sig"])[1] if pre else 0
             k.update(before=before["frame"], after=after["frame"], score=score,
                      changed_cells=changed, ambient_cells=ambient,
-                     visible=changed > max(SAME_CELLS, ambient + 1), on_black=before["black"])
+                     visible=changed > max(SAME_CELLS, ambient + 1), on_black=before["black"],
+                     at_s=before["t"])
 
     def stuck(self):
-        """Stuck: the last `--stuck-keys` presses, on a screen that is not
-        black (a black one is a transition), showed nothing and the screen
+        """Stuck: the last `--stuck-keys` menu presses (on a screen that is not
+        black, a black one being a transition) showed nothing and the screen
         has not changed since the first of them; or, short of the world, no
-        capture changed for `--still` seconds."""
+        capture changed for `--still` seconds. Presses after the title left
+        the menus (the first log rule) do not count: loading takes no input."""
         caps, n = self.captures, self.args.stuck_keys
-        judged = sorted((k for k in self.keys if "visible" in k), key=lambda k: k["before"])[-n:]
+        left = min(self.log_stage_at.values(), default=float("inf"))
+        judged = sorted((k for k in self.keys if "visible" in k and k["at_s"] < left),
+                        key=lambda k: k["before"])[-n:]
         since = caps.last_distinct()
         if n and len(judged) == n and not any(k["visible"] or k["on_black"] for k in judged):
-            if since["frame"] <= judged[0]["before"]:
+            if since["frame"] <= judged[0]["before"] and caps.list[-1]["t"] < left:
                 return f"the last {n} presses had no visible effect"
         if self.stage != "world" and caps.list[-1]["t"] - since["t"] >= self.args.still:
             return f"no capture changed for {self.args.still:.0f} s"
@@ -419,7 +445,7 @@ class Run:
 def error_kind(error):
     """A translation error without where it happened (code offsets)."""
     kind = re.sub(r"^.*?code at 0x[0-9a-f]+: ", "", error)
-    return re.sub(r"0x[0-9a-f]+|\b\d+\b", "#", kind)
+    return re.sub(r"0x[0-9a-f]+", "#", kind)
 
 
 def load_stages(path):
@@ -460,8 +486,10 @@ def main():
                    help="script file used when --keys/--pad are not given")
     p.add_argument("--settle", type=int, default=30,
                    help="presented frames after a press its effect is looked for")
-    p.add_argument("--stuck-keys", type=int, default=3,
+    p.add_argument("--stuck-keys", type=int, default=5,
                    help="this many presses in a row without a visible effect end the run as stuck")
+    p.add_argument("--stuck-tail", type=float, default=60,
+                   help="an unchanged screen this long at the end is reported as stuck_at")
     p.add_argument("--still", type=float, default=900,
                    help="short of the world, no capture changing for this long ends the run as stuck")
     p.add_argument("--data", default="fresh",
@@ -498,6 +526,7 @@ def main():
                     script[kind].append(entry.strip())
         args.keys = ",".join(script["key"]) if args.keys is None else args.keys
         args.pad = ",".join(script["pad"]) if args.pad is None else args.pad
+    args.keys, args.pad = expand(args.keys), expand(args.pad)
     presses = [("key", *k) for k in parse_script(args.keys, KEY_NAMES, letters=True)]
     presses += [("pad", *k) for k in parse_script(args.pad, PAD_NAMES)]
 
@@ -715,8 +744,11 @@ def finish(run, meta, end, code, stopped):
             how = "device-removed"
         elif run.crash or (code is not None and code >= 0xC0000000):
             how = "crash"
-        else:
+        elif run.ended_itself:
             how = "exit"
+        else:
+            # Neither the title's end nor VIctory's: ended from outside.
+            how = "killed"
     else:
         how = end
     failure = run.gpu_failure or ""
@@ -730,6 +762,10 @@ def finish(run, meta, end, code, stopped):
     frames = max([run.frames] + [c["frame"] for c in caps.list])
     lit = [c["frame"] for c in caps.list if not c["black"]]
     distinct = caps.last_distinct()
+    # The screen the run ended on, when it stayed unchanged for a while.
+    tail = caps.list[-1]["t"] - distinct["t"] if caps.list else 0
+    if how != "stuck" and tail >= args.stuck_tail:
+        run.stuck_why = f"no capture changed in the last {tail:.0f} s"
     with open(os.path.join(d, "captures.json"), "w", encoding="utf-8") as f:
         json.dump(caps.table(), f, indent=1)
     summary = {
@@ -751,7 +787,7 @@ def finish(run, meta, end, code, stopped):
             "at_s": distinct["t"],
             "presses_without_effect": [k["device"] + " " + k["entry"] for k in run.keys
                                        if k.get("visible") is False and k["before"] >= distinct["frame"]],
-        } if how == "stuck" else None,
+        } if run.stuck_why else None,
         "stopped_by_harness": stopped,
         "exit_code": code_text,
         "seconds": round(run.elapsed(), 1),
