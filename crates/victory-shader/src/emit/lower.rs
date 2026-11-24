@@ -46,8 +46,12 @@ pub(crate) struct Parts<'a> {
     pub io: &'a Io,
     pub res: &'a Resources,
     pub inputs: Vec<SigElement>,
+    /// Vertex or mesh outputs and per-primitive outputs as the console
+    /// code writes them (exports find their element here).
     pub outputs: Vec<SigElement>,
     pub prims: Vec<SigElement>,
+    /// Linked to a pixel shader: what the shader declares instead.
+    pub linked: Option<Linked>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
 }
@@ -188,6 +192,9 @@ struct Lower<'a> {
     /// Pixel input rows declared constant, interpolated by hand
     /// ([`manual_rows`]).
     manual_rows: HashSet<u8>,
+    /// Pixel: every target is written in every lane a last export keeps
+    /// ([`exact_exports`]).
+    exact_exports: bool,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -633,6 +640,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             half_inputs: halves,
             manual_rows,
+            exact_exports: x.native.stage != HwStage::Ps || exact_exports(x),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -7200,9 +7208,10 @@ impl<'a> Lower<'a> {
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
         // A pixel's last export discards the lanes outside EXEC; any other
-        // export under a guard writes only the lanes the guard holds (a
-        // pixel output it skips stays undefined, where the console's keeps
-        // the target's value).
+        // export writes only the lanes that run it ([`exact_exports`]).
+        if self.s.pixel && !self.exact_exports {
+            return Err("a pixel export some lanes reaching a last one skip");
+        }
         let kills = guard.is_some() && !mesh && e.done && self.s.pixel;
         if let Some(g) = guard
             && kills
@@ -7221,15 +7230,12 @@ impl<'a> Lower<'a> {
             Usage::Other(0) if mesh => self.unnamed_row(),
             _ => Some(row),
         };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
+        // (output element, channel) per exported channel, among the elements
+        // the code writes; per-primitive outputs are elements of `prims`.
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
-        let outputs = if primitive {
-            &self.s.prims
-        } else {
-            &self.s.outputs
-        };
+        let x = self.x;
+        let outputs = if primitive { &x.prims } else { &x.outputs };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
@@ -7331,12 +7337,26 @@ impl<'a> Lower<'a> {
                 &mut l.s.outputs
             }
         }
-        if stores
-            .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
-        {
+        if stores.iter().any(|s| s.3.is_none() && outputs[s.0].half) {
             return Err("a 16-bit output the stage data does not mark");
         }
+        // A linked shader's stores go to the element it declares, in the
+        // columns it declares; the others are dropped.
+        let stores: Vec<_> = stores
+            .into_iter()
+            .filter_map(|(id, col, value, half)| {
+                let Some(l) = &x.linked else {
+                    return Some((id, col, value, half));
+                };
+                let (ids, declared) = if primitive {
+                    (&l.prim_ids, &l.prims)
+                } else {
+                    (&l.out_ids, &l.outputs)
+                };
+                let id = ids[id]?;
+                (col < declared[id].cols).then_some((id, col, value, half))
+            })
+            .collect();
         // A lane writes where it exports (a mesh lane its own vertex or
         // primitive).
         let at = if kills {
@@ -7435,7 +7455,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)
@@ -7854,7 +7874,7 @@ mod tests {
         header.extend(32u32.to_le_bytes());
         header.extend(0u32.to_le_bytes());
         let c = crate::Container::parse(&header)?;
-        let mut dxil = super::super::emit(&c, &native, &p, &st, &io, &res)?.dxil;
+        let mut dxil = super::super::emit(&c, &native, &p, &st, &io, &res, None)?.dxil;
         let path = super::super::validator::Validator::default_path();
         if let Ok(mut v) = super::super::validator::Validator::load(path.as_deref()) {
             v.validate(&mut dxil).unwrap();

@@ -84,6 +84,18 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Linked to a pixel shader** ([`translate_linked`], added
+//!   2026-11-24): a vertex or mesh shader then declares its outputs in the
+//!   translated pixel shader's input layout: each output the pixel shader
+//!   reads (same semantic name and index) at the input's row, columns,
+//!   type and interpolation mode; system values it does not read on rows
+//!   past those; inputs nothing writes declared unwritten; other outputs
+//!   left out, with the stores to them. The console links stages by
+//!   semantic, and its vertex and pixel signatures place them at
+//!   different registers, which PC linking refuses
+//!   ([`link_mismatches`]). It also keeps mesh shaders under the
+//!   validator's [`MESH_OUTPUT_LIMIT`] ([`HostShader::mesh_output_bytes`]):
+//!   some console mesh programs declare more than any pixel shader reads.
 
 mod bitcode;
 mod container;
@@ -180,6 +192,32 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// A mesh shader's vertex plus primitive output bytes as the validator
+    /// counts them: every declared component, 4 bytes, for each of the
+    /// maximum vertices or primitives rounded up to 32. 0 for other stages.
+    pub fn mesh_output_bytes(&self) -> u32 {
+        if self.stage != HwStage::Ms {
+            return 0;
+        }
+        let Ok(c) = Container::parse(&self.dxil) else {
+            return 0;
+        };
+        let components = |fourcc| {
+            c.part(fourcc)
+                .and_then(|p| signature(p.data, false).ok())
+                .map_or(0, |els| els.iter().map(|e| u32::from(e.cols)).sum::<u32>())
+        };
+        // PSV0: its runtime info's size, then the info (mesh maxima at 12
+        // and 14).
+        let max = |at: usize| {
+            c.part(FourCC::PSV0)
+                .and_then(|p| p.data.get(4 + at..6 + at))
+                .map_or(0, |b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+        };
+        4 * (components(FourCC::OSG1) * max(12).next_multiple_of(32)
+            + components(FourCC::PSG1) * max(14).next_multiple_of(32))
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -198,6 +236,12 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_linked(container, None)
+}
+
+/// [`translate`], a vertex or mesh program declaring only the outputs
+/// `link` reads.
+pub fn translate_linked(container: &[u8], link: Option<&Link>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -218,10 +262,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(&c, &native, &p, &st, &io, &res, link)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran; a vertex or mesh
+/// program declares only the outputs `link` reads.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -229,6 +274,7 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    link: Option<&Link>,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc, input| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -296,6 +342,8 @@ pub fn emit(
     for e in &mut prims {
         e.interp = 1;
     }
+    // Linked to a pixel shader: its inputs' layout.
+    let linked = link.filter(|_| !pixel).map(|l| l.declare(&outputs, &prims));
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -322,6 +370,7 @@ pub fn emit(
         inputs,
         outputs,
         prims,
+        linked,
         mesh_stride,
     })?;
     Ok(HostShader {

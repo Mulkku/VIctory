@@ -461,10 +461,10 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&first), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, first, code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -472,7 +472,7 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(?shaders, linked = linked.is_some(), "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -489,7 +489,7 @@ impl HostPipeline {
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
+            VS: first,
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
@@ -515,7 +515,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&first), &code_bytes(&code(1))],
             &state,
         );
         let made = super::library::pipeline(
@@ -533,7 +533,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, linked = linked.is_some(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -555,6 +555,69 @@ impl HostPipeline {
             inputs: g.elements(),
         })
     }
+}
+
+/// A vertex or mesh shader translated again in `ps`'s input layout
+/// (`victory_shader::emit::translate_linked`) when its outputs do not link
+/// to `ps`'s inputs as they stand (the console links by semantic, its
+/// stages' registers differ) or exceed what the validator allows a mesh
+/// shader (`MESH_OUTPUT_LIMIT`); once per pair. `None` when it links as it
+/// is, or the linked translation fails or binds differently.
+fn linked_first(first: &Arc<Shader>, ps: &Arc<Shader>) -> Option<Arc<Vec<u8>>> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use victory_shader::emit::{Link, MESH_OUTPUT_LIMIT, link_mismatches, translate_linked};
+    type Pairs = HashMap<(String, String), Option<Arc<Vec<u8>>>>;
+    static LINKED: LazyLock<Mutex<Pairs>> = LazyLock::new(Mutex::default);
+    let full = &first.translated()?.host;
+    let pixel = &ps.translated()?.host;
+    let bytes = full.mesh_output_bytes();
+    let mismatches = link_mismatches(full, pixel);
+    if bytes <= MESH_OUTPUT_LIMIT && mismatches.is_empty() {
+        return None;
+    }
+    let key = (first.hash.clone(), ps.hash.clone());
+    if let Some(done) = LINKED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return done.clone();
+    }
+    let made = Link::pixel(pixel)
+        .and_then(|link| translate_linked(&first.container, Some(&link)))
+        .map_err(|e| e.to_string())
+        .and_then(|l| {
+            let same = l.user_data == full.user_data
+                && l.samplers == full.samplers
+                && l.static_samplers == full.static_samplers
+                && l.root_cbvs == full.root_cbvs
+                && l.root_srvs == full.root_srvs;
+            if same {
+                Ok(l)
+            } else {
+                Err("the linked translation binds differently".to_owned())
+            }
+        });
+    let done = match made {
+        Ok(l) => {
+            tracing::info!(
+                first = %first.hash,
+                ps = %ps.hash,
+                bytes,
+                linked_bytes = l.mesh_output_bytes(),
+                mismatches = mismatches.len(),
+                left = link_mismatches(&l, pixel).len(),
+                "outputs placed in the pixel shader's input layout"
+            );
+            Some(Arc::new(l.dxil))
+        }
+        Err(error) => {
+            tracing::warn!(first = %first.hash, ps = %ps.hash, bytes, %error, "outputs not relinked");
+            None
+        }
+    };
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, done.clone());
+    done
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state

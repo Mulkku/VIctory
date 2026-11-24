@@ -154,14 +154,31 @@ impl Tally {
     }
 }
 
-/// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+/// An emitted vertex, mesh or pixel shader kept for `VICTORY_PAIRS`.
+struct KeptShader {
+    label: String,
+    /// The first 16 hex digits of the container's BLAKE3, as run logs name
+    /// shaders.
+    hash: String,
+    /// The BLAKE3 of its DXIL part (duplicates point at it).
+    dxil: blake3::Hash,
+    container: Vec<u8>,
+    shader: emit::HostShader,
+}
+
+/// Shaders kept for `VICTORY_PAIRS`, shared between threads, and the
+/// container hashes of duplicates with the DXIL hash of their original.
+#[derive(Default)]
+struct Kept {
+    shaders: Vec<KeptShader>,
+    aliases: Vec<(String, blake3::Hash)>,
+}
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
-    /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
-    /// kept to build those pipelines after the walk.
-    keep: Option<Kept>,
+    /// Vertex, mesh and pixel shaders, kept to build the pipelines of
+    /// `VICTORY_PAIRS` after the walk.
+    keep: Option<std::sync::Arc<Mutex<Kept>>>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
 }
@@ -186,13 +203,21 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    // `VICTORY_PAIRS`: comma-separated `first+pixel` pairs, each a label
+    // substring or a container hash prefix as run logs give it; the entry
+    // `oversized` pairs every mesh shader whose outputs exceed the
+    // validator's limit with the pixel shaders of its effect.
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .filter_map(|p| match p.trim() {
+            "oversized" => Some(("oversized".to_owned(), String::new())),
+            p => p
+                .split_once('+')
+                .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned())),
+        })
         .collect();
-    let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::new(Mutex::new(Kept::default()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -295,22 +320,7 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
-        }
+        link_pairs(&pairs, &lock(&kept), dll.as_deref(), pipelines)?;
     }
     let mut lines = t.lines;
     lines.sort();
@@ -343,8 +353,13 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let dxil_hash = blake3::hash(dxil);
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    if !lock(seen).insert(dxil_hash) {
         t.duplicates += 1;
+        if let Some(keep) = &checks.keep {
+            lock(keep).aliases.push((hash, dxil_hash));
+        }
         return;
     }
     let programs = match native_programs(dxil) {
@@ -410,9 +425,20 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(&container, &p, &program, &s, &i, &r, None) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            if let Some(keep) = &checks.keep
+                                && matches!(shader.stage, HwStage::Vs | HwStage::Ms | HwStage::Ps)
+                            {
+                                lock(keep).shaders.push(KeptShader {
+                                    label: label(),
+                                    hash: hash.clone(),
+                                    dxil: dxil_hash,
+                                    container: bytes.to_vec(),
+                                    shader: shader.clone(),
+                                });
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -441,9 +467,6 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
-    }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
