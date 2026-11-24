@@ -407,6 +407,10 @@ impl State {
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
+            #[cfg(feature = "diagnostics")]
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                list.note_object(h, "heap");
+            }
         }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -425,6 +429,8 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = self.pipeline;
             list.used_pipeline(&p.name);
+            #[cfg(feature = "diagnostics")]
+            list.note_object(self.pipeline, "pipeline");
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -576,6 +582,8 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            list.note_slot(std::ptr::from_ref(heap) as usize, index, host.made_key(index));
             readable(list, u, &view);
         }
     }

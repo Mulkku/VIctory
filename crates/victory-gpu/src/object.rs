@@ -124,7 +124,20 @@ pub(crate) fn hand_out<T>(
         // Asked only whether creation would succeed.
         return S_FALSE;
     }
-    answer(kind, iid, Some(Box::into_raw(object).cast()), out)
+    let raw: This = Box::into_raw(object).cast();
+    #[cfg(feature = "diagnostics")]
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(raw as usize);
+    answer(kind, iid, Some(raw), out)
+}
+
+/// Diagnostics: objects made by [`hand_out`] and not freed yet.
+#[cfg(feature = "diagnostics")]
+static LIVE: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Diagnostics: whether `this` (made by [`hand_out`]) is still alive.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn alive(this: usize) -> bool {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).contains(&this)
 }
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
@@ -134,6 +147,8 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
             private_data().retain(|&(object, _), _| object != this as usize);
+            #[cfg(feature = "diagnostics")]
+            LIVE.lock().unwrap_or_else(|e| e.into_inner()).remove(&(this as usize));
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0

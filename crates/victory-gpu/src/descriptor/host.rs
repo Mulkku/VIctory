@@ -229,6 +229,13 @@ impl HostHeap {
         }
     }
 
+    /// Diagnostics: the record key slot `index` was last made from.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).copied().unwrap_or(0)
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
