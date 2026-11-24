@@ -8,11 +8,13 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::{Atomic64, Atomic64View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -360,7 +362,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -414,12 +418,11 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. False if the draw or dispatch must not
+    /// run (a view 64-bit atomics cannot use).
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -463,6 +466,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let made = self.tables(list, &t.used, compute);
+            if !self.atomic64_views(list, t, &made, compute) {
+                return false;
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -523,6 +529,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -547,7 +554,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -639,6 +648,73 @@ impl State {
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view);
         }
+    }
+
+    /// Makes the views a shader uses with 64-bit atomics integer views (see
+    /// [`Atomic64`]), after [`State::tables`] made their slots (`made`:
+    /// its tables made afresh); false if one cannot be.
+    fn atomic64_views(
+        &self,
+        list: &HostList,
+        t: &crate::pipeline::Translated,
+        made: &[(u8, u32)],
+        compute: bool,
+    ) -> bool {
+        for &(slot, dword) in &t.host.atomic64_views {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                once!(slot, "a 64-bit atomic view in a table the title did not set; draw skipped");
+                return false;
+            };
+            let handle = table + u64::from(dword) * 4;
+            let found = match made.iter().find(|m| m.0 == slot) {
+                // A table made afresh in dynamic slots, as far as its
+                // used-resource entries go.
+                Some(&(_, offset)) => t
+                    .used
+                    .iter()
+                    .any(|u| u.slot == slot && u.table_offset_dwords / 8 >= dword / 8)
+                    .then(|| self.heap_of(table))
+                    .flatten()
+                    .and_then(|heap| {
+                        let view = crate::descriptor::view(handle)?;
+                        Some((heap.host()?, offset / 32 + dword / 8, view))
+                    }),
+                None => self.heap_of(handle).and_then(|heap| {
+                    let (host, index) = (heap.host()?, heap.index(handle)?);
+                    Some((host, index, host.mirror(index, handle, true)?))
+                }),
+            };
+            let Some((host, index, view)) = found else {
+                once!(slot, "a 64-bit atomic view without a view; draw skipped");
+                return false;
+            };
+            let checked = host.atomic64_at(index, &view);
+            // Each kind of view once: refused ones are what the title
+            // loses, the others what it binds.
+            static SEEN: Mutex<Vec<Atomic64View>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&checked) {
+                seen.push(checked);
+                let (resource, view, outcome) = (checked.resource, checked.view, checked.outcome);
+                if outcome == Atomic64::Refused {
+                    tracing::warn!(
+                        resource,
+                        view,
+                        "64-bit atomic view of another format; draw skipped"
+                    );
+                } else {
+                    tracing::info!(resource, view, ?outcome, "64-bit atomic view");
+                }
+            }
+            if checked.outcome == Atomic64::Refused {
+                return false;
+            }
+            if let View::Unordered(resource, _, _) = view {
+                const UNORDERED_ACCESS: u32 = 0x8;
+                crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            }
+        }
+        true
     }
 
     /// The descriptors a shader reads through tables. Tables holding a

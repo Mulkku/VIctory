@@ -355,6 +355,28 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Makes slot `index`, made from `view`, a view 64-bit typed atomics
+    /// can use (see [`Atomic64`]).
+    pub(crate) fn atomic64_at(&self, index: u32, view: &View) -> Atomic64View {
+        let View::Unordered(resource, _, desc) = view else {
+            return Atomic64View {
+                outcome: Atomic64::Refused,
+                resource: 0,
+                view: 0,
+            };
+        };
+        let desc = desc.as_ref().map(uav_desc);
+        match crate::resource::host_resource(*resource as crate::object::This) {
+            Some(texture) => atomic64_view(texture, desc, self.cpu(index)),
+            // A buffer view: typed 64-bit atomics are texture ones here.
+            None => Atomic64View {
+                outcome: Atomic64::Refused,
+                resource: 0,
+                view: desc.map_or(0, |d| d.Format.0 as u32),
+            },
+        }
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -713,6 +735,137 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// What became of a view a shader uses with 64-bit typed atomics. Those
+/// need an `R32G32_UINT` or `_SINT` texture view; the title's view may
+/// name another format of the family, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Atomic64 {
+    /// The slot already holds such a view.
+    Kept,
+    /// Made again as one, of the same subresources.
+    Remade,
+    /// No such view of the resource exists (another family, a float-typed
+    /// texture, a buffer, no resource). A null view is no substitute: the
+    /// atomics would be dropped silently.
+    Refused,
+}
+
+/// [`Atomic64`] with the formats it was decided on: the host resource's
+/// and the title view's (as the host has them; 0 for none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Atomic64View {
+    pub(crate) outcome: Atomic64,
+    pub(crate) resource: u32,
+    pub(crate) view: u32,
+}
+
+const R32G32_TYPELESS: u32 = 15;
+const R32G32_UINT: u32 = 17;
+const R32G32_SINT: u32 = 18;
+
+/// Checks the view [`make`] made at `at` from `desc` of `texture` for
+/// 64-bit atomics, and makes it again as an integer view if it is not one.
+fn atomic64_view(
+    texture: &ID3D12Resource,
+    desc: Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Atomic64View {
+    use crate::resource::family;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let own = d.Format.0 as u32;
+    let view = desc.map_or(0, |v| v.Format.0 as u32);
+    let mut out = Atomic64View {
+        outcome: Atomic64::Refused,
+        resource: own,
+        view,
+    };
+    let format = match own {
+        R32G32_TYPELESS => R32G32_UINT,
+        R32G32_UINT | R32G32_SINT => own,
+        _ => return out,
+    };
+    if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        return out;
+    }
+    // `make` gives a typed texture's view the texture's format when the
+    // view names its family or no format; a typeless one's the view's.
+    let kept = if own == R32G32_TYPELESS {
+        matches!(view, R32G32_UINT | R32G32_SINT)
+    } else {
+        view == 0 || family(view) == family(own)
+    };
+    if kept {
+        out.outcome = Atomic64::Kept;
+        return out;
+    }
+    let Some(host) = host() else { return out };
+    let mut desc = desc.unwrap_or_else(|| whole_texture_uav(&d));
+    desc.Format = DXGI_FORMAT(format as i32);
+    // SAFETY: a live texture and a slot of our heap.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            texture,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+    out.outcome = Atomic64::Remade;
+    out
+}
+
+/// An unordered view of mip 0 of every layer (or slice) of a texture.
+fn whole_texture_uav(d: &D3D12_RESOURCE_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let layers = u32::from(d.DepthOrArraySize);
+    let (dimension, view) = match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if layers > 1 => (
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: layers,
+                    ..Default::default()
+                },
+            },
+        ),
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => (
+            D3D12_UAV_DIMENSION_TEXTURE1D,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_UAV::default(),
+            },
+        ),
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => (
+            D3D12_UAV_DIMENSION_TEXTURE3D,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    WSize: layers,
+                    ..Default::default()
+                },
+            },
+        ),
+        _ if layers > 1 => (
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: layers,
+                    ..Default::default()
+                },
+            },
+        ),
+        _ => (
+            D3D12_UAV_DIMENSION_TEXTURE2D,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV::default(),
+            },
+        ),
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: d.Format,
+        ViewDimension: dimension,
+        Anonymous: view,
+    }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -870,5 +1023,73 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// A 4x4 texture with unordered access, in GPU memory.
+    fn texture(format: u32) -> ID3D12Resource {
+        let host = host().unwrap();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(format as i32),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain resource creation.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut texture,
+            )
+        }
+        .unwrap();
+        texture.unwrap()
+    }
+
+    /// Views 64-bit atomics use: a typeless R32G32 texture's are made
+    /// again as integer views (the title's float view or none); a float
+    /// R32G32 texture and a single-channel one have none.
+    #[test]
+    fn atomic64_views_are_remade_or_refused() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let view = |format: u32| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT(format as i32),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        const FLOAT: u32 = 16;
+        const R32_UINT: u32 = 42;
+        let cases = [
+            (R32G32_TYPELESS, Some(FLOAT), Atomic64::Remade),
+            (R32G32_TYPELESS, None, Atomic64::Remade),
+            (R32G32_TYPELESS, Some(R32G32_UINT), Atomic64::Kept),
+            (R32G32_UINT, Some(FLOAT), Atomic64::Kept),
+            (FLOAT, Some(FLOAT), Atomic64::Refused),
+            (R32_UINT, Some(R32_UINT), Atomic64::Refused),
+        ];
+        for (k, (own, desc, outcome)) in cases.into_iter().enumerate() {
+            let t = texture(own);
+            let got = atomic64_view(&t, desc.map(view), heap.cpu(k as u32 % 4));
+            assert_eq!(got.outcome, outcome, "texture {own} view {desc:?}");
+            assert_eq!((got.resource, got.view), (own, desc.unwrap_or(0)));
+        }
     }
 }
