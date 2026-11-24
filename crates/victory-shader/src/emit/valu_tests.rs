@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -33,6 +33,15 @@ const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
         0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
         125 << 25,
+    ]
+}
+
+/// SMEM `op s[dst..], s[base:base+1], soffset offset:offset` (`soffset`
+/// 125: none).
+const fn smem(op: u8, dst: u8, base: u8, soffset: u8, offset: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op as u32) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        (soffset as u32) << 25 | (offset & 0x1F_FFFF),
     ]
 }
 
@@ -69,6 +78,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, false)
+}
+
+/// [`build_valu_cs`], with the resource heap's base in `s6` if `heap`.
+fn build_cs(body: &[u32], heap: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,28 +97,41 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    if heap {
+        layout.push(RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 6,
+            slot: 2,
+        });
+    }
+    // User SGPRs s0..s4, and s5 (unused) and s6 with the heap.
+    let user_sgprs: u32 = if heap { 7 } else { 5 };
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
-        layout: vec![
-            RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 4,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            },
-        ],
+        layout,
         used: vec![UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
@@ -116,7 +143,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            rsrc2: user_sgprs << 1,
             threads: [1, 1, 1],
         }),
         code,
@@ -150,6 +177,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         atomic64_views: lowered.atomic64_views,
+        views: lowered.views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -167,6 +195,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with(shader, cases, &[View::RawUav(1)], check);
+}
+
+/// [`run_cases`] with these views in the heap (the result's raw UAV first).
+fn run_cases_with(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    views: &[View],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let mut ran = 0;
@@ -193,7 +231,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -674,5 +712,32 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
         );
+    });
+}
+
+#[test]
+fn scalar_loads_of_a_heap_buffer_read_its_shader_view() {
+    // The heap index computed from s0; dword 1 of that descriptor's buffer
+    // read with a scalar load, as world compute programs read the title's
+    // shader views. A constant buffer read would not match the host's view.
+    let mut body = vec![
+        s_mov_b32(20, 6),
+        s_mov_b32(21, 0x80),     // inline constant 0
+        sop2(0x1E, 22, 0, 0x85), // s_lshl_b32 s22, s0, 5
+    ];
+    body.extend_from_slice(&smem(0x02, 24, 20, 22, 0)); // s_load_dwordx4 s[24:27], s[20:21], s22
+    body.extend_from_slice(&smem(0x08, 28, 24, 125, 4)); // s_buffer_load_dword s28, s[24:27], 4
+    body.push(vop1(0x001, 0, sgpr(28))); // v_mov_b32 v0, s28
+    let shader = build_cs(&body, true);
+    let data = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let views = [
+        View::RawUav(1),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    run_cases_with(&shader, &[[1, 0, 0, 0]], &views, |backend, _, _, got| {
+        assert_eq!(got, data[1], "{backend}: {got:#010x}");
     });
 }

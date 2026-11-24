@@ -54,9 +54,13 @@
 //!   and the attribute offset are the shader's own arithmetic on data in
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
-//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics,
+//!   typed-format loads without an index, and scalar loads
+//!   (`s_buffer_load_dword*`) of a descriptor the used-resource list does
+//!   not name a constant buffer (heap-indexed ones included: such a
+//!   descriptor is the title's shader or unordered view); structured with
+//!   the used-resource entry's stride when indexed; typed with four 32-bit
+//!   float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
@@ -202,6 +206,10 @@ pub struct HostShader {
     /// index of a table, dword in the table). The host's view there must
     /// be `R32G32_UINT` or `_SINT`; bind nothing else.
     pub atomic64_views: Vec<(u8, u32)>,
+    /// The views the shader reads at fixed table or heap positions, with
+    /// the kind it declares for each: the host's view there must be of
+    /// that kind (a view of another dimension is invalid).
+    pub views: Vec<DeclaredView>,
 }
 
 impl HostShader {
@@ -466,6 +474,72 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// A descriptor a shader reads at a fixed position and the view it
+/// declares for it (the DXIL resource properties of its handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeclaredView {
+    /// Root parameter index of the table (as [`UserData::slot`]); none for
+    /// the resource heap itself.
+    pub slot: Option<u8>,
+    /// The descriptor's position in the table (or the heap).
+    pub index: u32,
+    pub kind: ViewKind,
+    /// Unordered access.
+    pub uav: bool,
+}
+
+/// What a declared view is: a texture of a D3D12 dimension or a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ViewKind {
+    /// A texture; the value is its `D3D12_SRV_DIMENSION` (the unordered
+    /// access dimensions share the numbers for the kinds they have).
+    Texture(u8),
+    /// Typed (`buffer_load_format`): four 32-bit float channels.
+    Typed,
+    Raw,
+    /// Structured, with the element size in bytes.
+    Structured(u32),
+}
+
+impl ViewKind {
+    /// The D3D12 view dimension: buffer (1) or the texture's.
+    pub fn dimension(self) -> u8 {
+        match self {
+            ViewKind::Texture(d) => d,
+            _ => 1,
+        }
+    }
+}
+
+impl DeclaredView {
+    /// The view a handle with DXIL resource properties `props` declares;
+    /// none for constant buffers and samplers.
+    pub(crate) fn from_props(slot: Option<u8>, index: u32, props: (u32, u32)) -> Option<Self> {
+        // DXIL resource kinds → D3D12 SRV dimensions.
+        let kind = match props.0 & 0xFF {
+            1 => ViewKind::Texture(2),  // 1D
+            2 => ViewKind::Texture(4),  // 2D
+            3 => ViewKind::Texture(6),  // 2D MS
+            4 => ViewKind::Texture(8),  // 3D
+            5 => ViewKind::Texture(9),  // cube
+            6 => ViewKind::Texture(3),  // 1D array
+            7 => ViewKind::Texture(5),  // 2D array
+            8 => ViewKind::Texture(7),  // 2D MS array
+            9 => ViewKind::Texture(10), // cube array
+            10 => ViewKind::Typed,
+            11 => ViewKind::Raw,
+            12 => ViewKind::Structured(props.1),
+            _ => return None,
+        };
+        Some(DeclaredView {
+            slot,
+            index,
+            kind,
+            uav: props.0 & 0x1000 != 0,
+        })
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -627,6 +701,7 @@ pub fn emit(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         atomic64_views: l.atomic64_views,
+        views: l.views,
     })
 }
 
@@ -894,6 +969,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             atomic64_views: Vec::new(),
+            views: Vec::new(),
         }
     }
 
@@ -996,6 +1072,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             atomic64_views: Vec::new(),
+            views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1008,6 +1085,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 atomic64_views: Vec::new(),
+                views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1195,5 +1273,25 @@ mod tests {
             }
             Err(e) => eprintln!("no WARP device ({e}); pipeline not made"),
         }
+    }
+
+    /// Handle properties name the view a shader declares: textures by
+    /// their D3D12 dimension, buffers by how they are read, UAVs by bit 12.
+    #[test]
+    fn declared_views_from_handle_properties() {
+        use super::{DeclaredView, ViewKind};
+        let v = |props| DeclaredView::from_props(Some(3), 7, props).map(|d| (d.kind, d.uav));
+        assert_eq!(v((2, 0x409)), Some((ViewKind::Texture(4), false)));
+        assert_eq!(v((7 | 0x1000, 0x105)), Some((ViewKind::Texture(5), true)));
+        assert_eq!(v((1, 0x409)), Some((ViewKind::Texture(2), false)));
+        assert_eq!(v((4, 0x409)), Some((ViewKind::Texture(8), false)));
+        assert_eq!(v((10, 0x409)), Some((ViewKind::Typed, false)));
+        assert_eq!(v((11 | 0x1000, 0)), Some((ViewKind::Raw, true)));
+        assert_eq!(v((12, 16)), Some((ViewKind::Structured(16), false)));
+        // Constant buffers and samplers declare no view.
+        assert_eq!(v((13, 0)), None);
+        assert_eq!(v((14, 0)), None);
+        assert_eq!(ViewKind::Raw.dimension(), 1);
+        assert_eq!(ViewKind::Texture(5).dimension(), 5);
     }
 }

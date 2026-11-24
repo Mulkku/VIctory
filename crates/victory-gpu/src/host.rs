@@ -308,6 +308,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Diagnostics: title objects (pipelines, heaps) the list's commands
+    /// name, checked for being alive at submission.
+    #[cfg(feature = "diagnostics")]
+    objects: Mutex<Vec<(usize, &'static str)>>,
+    /// Diagnostics: host heap slots draws read through tables (title heap,
+    /// index, record key), checked for being unchanged at submission.
+    #[cfg(feature = "diagnostics")]
+    slots: Mutex<Vec<(usize, u32, u64)>>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -518,6 +526,10 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                objects: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                slots: Mutex::default(),
             })
         }
     }
@@ -530,6 +542,10 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            list.check_alive();
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -918,6 +934,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.objects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1038,6 +1058,73 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    /// Diagnostics: notes a title object the list's commands name.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_object(&self, object: usize, kind: &'static str) {
+        self.objects.lock().unwrap_or_else(|e| e.into_inner()).push((object, kind));
+    }
+
+    /// Diagnostics: notes a host heap slot a draw reads through a table.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_slot(&self, heap: usize, index: u32, key: u64) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).push((heap, index, key));
+    }
+
+    /// Diagnostics: at submission, the title objects the list names (its
+    /// textures and what `note_object` noted) that the title has released
+    /// since they were recorded.
+    #[cfg(feature = "diagnostics")]
+    fn check_alive(&self) {
+        use std::sync::atomic::AtomicU64;
+        static DEAD: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let mut dead = [0u64; 3];
+        for &r in self.states.lock().unwrap_or_else(|e| e.into_inner()).keys() {
+            dead[0] += u64::from(!crate::object::alive(r));
+        }
+        for &(o, kind) in self.objects.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if !crate::object::alive(o) {
+                dead[if kind == "pipeline" { 1 } else { 2 }] += 1;
+            }
+        }
+        if dead.iter().any(|&d| d > 0) {
+            let totals: Vec<u64> = DEAD
+                .iter()
+                .zip(dead)
+                .map(|(t, d)| t.fetch_add(d, Ordering::Relaxed) + d)
+                .collect();
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 50 {
+                tracing::warn!(
+                    textures = dead[0],
+                    pipelines = dead[1],
+                    heaps = dead[2],
+                    ?totals,
+                    "LIFETIME: a submitted list names title objects released since recording"
+                );
+            }
+        }
+        let mut changed = 0u64;
+        for &(h, index, key) in self.slots.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if crate::object::alive(h)
+                && let Some(host) = crate::descriptor::heap(h as crate::object::This).host()
+                && host.made_key(index) != key
+            {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            static CHANGED: AtomicU64 = AtomicU64::new(0);
+            let total = CHANGED.fetch_add(changed, Ordering::Relaxed) + changed;
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 50 {
+                tracing::warn!(
+                    changed,
+                    total,
+                    "LIFETIME: host descriptor slots a submitted list reads were remade since recording"
+                );
+            }
         }
     }
 

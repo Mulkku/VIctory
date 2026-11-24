@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DeclaredView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -439,6 +440,10 @@ impl State {
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
+            #[cfg(feature = "diagnostics")]
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                list.note_object(h, "heap");
+            }
         }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -462,10 +467,12 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+            #[cfg(feature = "diagnostics")]
+            list.note_object(self.pipeline, "pipeline");
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.views, compute);
             if !self.atomic64_views(list, t, &made, compute) {
                 return false;
             }
@@ -646,6 +653,12 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            list.note_slot(
+                std::ptr::from_ref(heap) as usize,
+                index,
+                host.made_key(index),
+            );
             readable(list, u, &view);
         }
     }
@@ -666,19 +679,32 @@ impl State {
                 return false;
             };
             let handle = table + u64::from(dword) * 4;
+            let declared = t
+                .host
+                .views
+                .iter()
+                .find(|d| d.slot == Some(slot) && d.index == dword / 8);
             let found = match made.iter().find(|m| m.0 == slot) {
                 // A table made afresh in dynamic slots, as far as its
-                // used-resource entries go.
-                Some(&(_, offset)) => t
-                    .used
-                    .iter()
-                    .any(|u| u.slot == slot && u.table_offset_dwords / 8 >= dword / 8)
+                // used-resource entries and declared views go.
+                Some(&(_, offset)) => {
+                    let view = crate::descriptor::view(handle);
+                    // A view of another kind than declared is a null view
+                    // of the declared kind there (`tables`): nothing to
+                    // remake, the atomics see zeros.
+                    if declared
+                        .is_some_and(|d| !crate::descriptor::host::declares(view.as_ref(), d))
+                    {
+                        continue;
+                    }
+                    (declared.is_some()
+                        || t.used
+                            .iter()
+                            .any(|u| u.slot == slot && u.table_offset_dwords / 8 >= dword / 8))
                     .then(|| self.heap_of(table))
                     .flatten()
-                    .and_then(|heap| {
-                        let view = crate::descriptor::view(handle)?;
-                        Some((heap.host()?, offset / 32 + dword / 8, view))
-                    }),
+                    .and_then(|heap| Some((heap.host()?, offset / 32 + dword / 8, view?)))
+                }
                 None => self.heap_of(handle).and_then(|heap| {
                     let (host, index) = (heap.host()?, heap.index(handle)?);
                     Some((host, index, host.mirror(index, handle, true)?))
@@ -741,14 +767,24 @@ impl State {
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. So are tables holding a view of another dimension
+    /// (or access) than the shader declares there (`views`), with a null
+    /// view of the declared kind in its place: the console reads any null
+    /// descriptor as zeros, the host's views must match. Returns those
+    /// tables' new byte offsets by root parameter; the other tables' slots
+    /// are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        views: &[DeclaredView],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -777,6 +813,34 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        for d in views {
+            let Some(slot) = d.slot else {
+                // Directly indexed: no table to make afresh.
+                if let Some(heap) =
+                    (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))
+                    && !crate::descriptor::host::declares(
+                        crate::descriptor::view(heap.start + u64::from(d.index) * 32).as_ref(),
+                        d,
+                    )
+                {
+                    once!(
+                        index = d.index,
+                        "a heap view of another kind than the shader declares"
+                    );
+                }
+                continue;
+            };
+            if fresh.contains(&slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let view = crate::descriptor::view(table + u64::from(d.index) * 32);
+            if !crate::descriptor::host::declares(view.as_ref(), d) {
+                fresh.push(slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -800,12 +864,16 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            let declared: Vec<&DeclaredView> =
+                views.iter().filter(|d| d.slot == Some(slot)).collect();
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(declared.iter().map(|d| d.index + 1))
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // The table, what its entries hold (record words) and the views
+            // the shader declares in it.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -814,6 +882,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
+                declared.hash(&mut h);
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
@@ -837,8 +906,19 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                let wanted = declared.iter().find(|d| d.index == k);
+                if let Some(d) = wanted
+                    && !crate::descriptor::host::declares(view.as_ref(), d)
+                {
+                    host.make_declared_null(index, d);
+                    substituted(d, view.as_ref());
+                    continue;
+                }
+                match view {
+                    // A constant buffer view, but where the shader declares a
+                    // view (reads it raw): then the heap's raw view of it.
+                    Some(View::Constant(address, size)) if wanted.is_none() => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -1200,6 +1280,41 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+/// Views replaced by a null view of the kind the shader declares, so far.
+static SUBSTITUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a view replaced by a null view of the declared kind; each pair of
+/// declared and found kind logged once.
+fn substituted(declared: &DeclaredView, view: Option<&View>) {
+    let n = SUBSTITUTED.fetch_add(1, Ordering::Relaxed) + 1;
+    static SEEN: std::sync::Mutex<Vec<(DeclaredView, String)>> = std::sync::Mutex::new(Vec::new());
+    let found = match view {
+        None => "no view".to_owned(),
+        Some(View::Shader(_, Some(d))) => format!("shader view, dimension {}", d[1]),
+        Some(View::Unordered(_, _, Some(d))) => format!("unordered view, dimension {}", d[1]),
+        Some(v) => format!("{v:?}").chars().take(24).collect(),
+    };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (
+        DeclaredView {
+            index: 0,
+            slot: None,
+            ..*declared
+        },
+        found,
+    );
+    if !seen.contains(&key) {
+        tracing::warn!(
+            declared = ?key.0.kind,
+            uav = declared.uav,
+            found = key.1,
+            total = n,
+            "a view of another kind than the shader declares made a null view of that kind"
+        );
+        seen.push(key);
+    }
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
@@ -1209,9 +1324,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {

@@ -534,6 +534,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         atomic64_views: Vec::new(),
+        views: Vec::new(),
     }
 }
 

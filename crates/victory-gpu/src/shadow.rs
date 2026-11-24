@@ -29,6 +29,9 @@ pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
+    /// Where the copy starts in `buffer`: 0 but for copies of one view's
+    /// range ([`find_on`]).
+    base: u64,
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
@@ -94,9 +97,10 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// Offset of a title address from the buffer's start.
+    /// Offset of a title address inside the buffer in the copy's host
+    /// buffer.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        self.base + (address - self.start)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -107,11 +111,18 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        Shadow::at(buffer, 0, data, gpu, start, len)
+    }
+
+    /// A copy starting `base` bytes into `buffer` (`data` and `gpu` are
+    /// that start's).
+    fn at(buffer: ID3D12Resource, base: u64, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
             data,
             gpu,
+            base,
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
@@ -463,6 +474,73 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
+    Some(shadow)
+}
+
+/// [`find`], for a view of `element`-byte elements (0: any start): the host
+/// makes buffer views from a whole element of the copy on, so a view whose
+/// start is not on one in the title buffer's copy (Grand Theft Auto VI
+/// places 64- and 96-byte views of 32-byte elements 16 bytes off) reads a
+/// copy of its range alone, starting on an element, made on first use and
+/// brought up to date as any copy.
+/// shortcut: such copies are never freed (64 KiB chunks hold many), and
+/// what shaders write to the title buffer's copy reaches them only through
+/// title memory, after that submission.
+pub(crate) fn find_on(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        return Some(shadow);
+    }
+    view_copy(address, len.max(1), element)
+}
+
+/// Copies of single views' ranges by (address, length, element), and the
+/// chunk new ones are cut from: buffer, mapping, GPU address, bytes used.
+struct ViewCopies {
+    copies: BTreeMap<(u64, u64, u64), Arc<Shadow>>,
+    chunk: Option<(ID3D12Resource, usize, u64, u64)>,
+}
+
+static VIEW_COPIES: Mutex<ViewCopies> = Mutex::new(ViewCopies {
+    copies: BTreeMap::new(),
+    chunk: None,
+});
+
+const VIEW_CHUNK: u64 = 1 << 16;
+
+fn view_copy(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let mut v = VIEW_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = v.copies.get(&(address, len, element)) {
+        return Some(shadow.clone());
+    }
+    let fits = |used: u64| used.next_multiple_of(element) + len <= VIEW_CHUNK;
+    let (buffer, data, gpu, at) = match &mut v.chunk {
+        Some((buffer, data, gpu, used)) if fits(*used) => {
+            let at = used.next_multiple_of(element);
+            *used = at + len;
+            (buffer.clone(), *data, *gpu, at)
+        }
+        _ => {
+            let size = len.max(VIEW_CHUNK);
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || "title buffer view copies".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            if size == VIEW_CHUNK {
+                v.chunk = Some((buffer.clone(), data as usize, gpu, len));
+            }
+            (buffer, data as usize, gpu, 0)
+        }
+    };
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        element,
+        "buffer view off its copy's elements: its range copied alone"
+    );
+    let data = (data + at as usize) as *mut u8;
+    let shadow = Arc::new(Shadow::at(buffer, at, data, gpu + at, address, len));
+    v.copies.insert((address, len, element), shadow.clone());
     Some(shadow)
 }
 
