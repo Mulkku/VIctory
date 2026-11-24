@@ -441,10 +441,12 @@ fn unordered_element(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads (its
-/// address and length) and its bytes per element (0: unknown).
+/// The title memory a buffer view reads (its address and length) and its
+/// bytes per element (0: unknown). Constant buffers count 16-byte
+/// elements, the alignment the raw views made of them need.
 fn buffer_extent(view: &View) -> Option<(u64, u64, u64)> {
     let (unordered, base, words): (bool, u64, &[u32; 10]) = match view {
+        &View::Constant(address, size) => return Some((address, u64::from(size), 16)),
         View::Shader(r, Some(desc)) => (
             false,
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
@@ -476,8 +478,9 @@ fn buffer_extent(view: &View) -> Option<(u64, u64, u64)> {
     Some((base + first * element, u64::from(count) * element, element))
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// The title memory a buffer view (shader, unordered access or constant
+/// buffer) reads: its address and length.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     buffer_extent(view).map(|(address, len, _)| (address, len))
 }
@@ -617,21 +620,31 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+            // Translated shaders read the constant buffers the heap holds
+            // raw (`victory_shader::emit`): one read as a constant buffer is
+            // in a table its used-resource list names, which draws make
+            // afresh with constant buffer views of their own (`tables` in
+            // draw.rs). Raw views also take the console's 16-byte
+            // alignment, where constant buffer views need 256.
+            let (shadow, ..) = buffer_copy(view)?;
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: shadow.offset(address) / 4,
+                        NumElements: size.div_ceil(4),
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
             };
-            // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            // SAFETY: a live buffer and a slot of our heap; the range lies
+            // in the host copy.
+            unsafe {
+                device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            };
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -734,7 +747,6 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// cannot make: unordered access or a shader view, of a buffer or of the
 /// title's texture dimension. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     let dimension = match view {
         View::Unordered(r, _, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 1,
@@ -760,11 +772,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        // Constant buffers in the heap are raw views (`make`).
+        View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
     null_unordered(dimension, D3D12_BUFFER_UAV_FLAG_NONE, 0, at);
@@ -853,8 +862,8 @@ fn null_unordered(
 
 /// Whether the view the host makes for the title's `view` (or the null
 /// view it puts in its place; `None`: no view recorded) has the dimension
-/// and access `declared` says. Constant buffers never do; samplers are
-/// not checked.
+/// and access `declared` says. Constant buffers are raw buffer views in
+/// the heap (`make`); samplers are not checked.
 pub(crate) fn declares(view: Option<&View>, declared: &DeclaredView) -> bool {
     let dimension = |r: usize, desc: Option<&[u32; 10]>| match desc {
         Some(d) if d[1] != 0 => d[1],
@@ -870,7 +879,7 @@ pub(crate) fn declares(view: Option<&View>, declared: &DeclaredView) -> bool {
         Some(View::Unordered(r, _, desc)) => (true, dimension(*r, desc.as_ref())),
         Some(View::Placed(u, resource, _)) if resource[0] == 1 => (*u, 1),
         Some(View::Placed(u, _, desc)) => (*u, desc[1]),
-        Some(View::Constant(..)) => return false,
+        Some(View::Constant(..)) => (false, 1),
         Some(_) => return true,
     };
     made == (declared.uav, u32::from(declared.kind.dimension()))
@@ -1090,6 +1099,10 @@ mod tests {
         // No view: the 2D null view every slot starts with.
         assert!(declares(None, &tex2d));
         assert!(!declares(None, &raw));
-        assert!(!declares(Some(&View::Constant(0x1000, 256)), &raw));
+        // Constant buffers: raw shader views in the heap.
+        let constant = View::Constant(0x1000, 256);
+        assert!(declares(Some(&constant), &raw));
+        assert!(!declares(Some(&constant), &raw_uav));
+        assert!(!declares(Some(&constant), &tex2d));
     }
 }

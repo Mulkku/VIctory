@@ -2769,8 +2769,19 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        // A constant buffer only where the used-resource list says so (or a
+        // root CBV): the console's buffer descriptor serves scalar and
+        // vector loads alike, and descriptors from the heap or a table entry
+        // the list does not name are the title's shader or unordered views
+        // (vector loads of the same descriptor read them raw), so a CBV
+        // handle there would not match the host's view.
+        let raw = match kind {
+            Some(u) => u.kind != ResourceType::Cbv,
+            None => !matches!(src, Source::Built { .. }),
+        };
+        if raw {
+            let uav = kind.is_some_and(|u| u.kind == ResourceType::Uav);
+            let h = self.handle(site, src, false, (11 | if uav { 0x1000 } else { 0 }, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);

@@ -759,7 +759,8 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
-                if let Some(d) = declared.iter().find(|d| d.index == k)
+                let wanted = declared.iter().find(|d| d.index == k);
+                if let Some(d) = wanted
                     && !crate::descriptor::host::declares(view.as_ref(), d)
                 {
                     host.make_declared_null(index, d);
@@ -767,7 +768,9 @@ impl State {
                     continue;
                 }
                 match view {
-                    Some(View::Constant(address, size)) => {
+                    // A constant buffer view, but where the shader declares a
+                    // view (reads it raw): then the heap's raw view of it.
+                    Some(View::Constant(address, size)) if wanted.is_none() => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

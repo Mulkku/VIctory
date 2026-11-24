@@ -40,9 +40,13 @@
 //!   and the attribute offset are the shader's own arithmetic on data in
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
-//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics,
+//!   typed-format loads without an index, and scalar loads
+//!   (`s_buffer_load_dword*`) of a descriptor the used-resource list does
+//!   not name a constant buffer (heap-indexed ones included: such a
+//!   descriptor is the title's shader or unordered view); structured with
+//!   the used-resource entry's stride when indexed; typed with four 32-bit
+//!   float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
