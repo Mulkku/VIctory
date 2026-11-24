@@ -12,11 +12,15 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! The guards are per address, so a write through another view of the same
+//! pages is not seen at the guarded addresses. The runtime's own writers
+//! open the guards of every address showing what they write
+//! ([`writing`], as `kernel_will_write`; DirectStorage in `victory-hle`).
+//!
+//! shortcut: the title's own CPU writes through one view are not seen at
+//! another view of the same pages a copy guards (no case is known to
+//! matter). A system call writing into a guarded block fails (none is
+//! known to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -366,5 +370,48 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A write into a guarded block's pages through another view of the
+    /// same section counts the block as written.
+    #[test]
+    #[ignore = "known gap (module docs, shortcut): guards are per address, so the title's CPU writes through another view are not seen"]
+    fn writes_through_another_view_count_as_written() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write twice.
+        let (a, b) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (map(), map())
+        };
+        assert!(a != 0 && b != 0 && a != b);
+        // A copy takes both blocks of view A: guarded and clean.
+        assert!(guard(a, a + 2 * BLOCK).is_some());
+        assert_eq!(guard(a, a + 2 * BLOCK), Some(Vec::new()));
+        // SAFETY: view B is ours and not guarded.
+        unsafe { std::ptr::write_bytes((b + 100) as *mut u8, 2, 13) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((a + 100) as *const u8).read() }, 2, "one memory");
+        assert_eq!(
+            guard(a, a + 2 * BLOCK),
+            Some((a / PAGE..a / PAGE + 1).collect()),
+            "the block written through view B is reported written at view A"
+        );
+        for v in [a, b] {
+            // SAFETY: our views.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
+        }
+        title_memory_remapped(a, 2 * BLOCK);
     }
 }
