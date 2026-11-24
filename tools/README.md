@@ -17,7 +17,7 @@ flock D:/victory-runs/gpu.lock python tools/vrun.py target/diag/victory.exe --la
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--label` | required | run name: folder suffix, ledger |
-| `--mode warp\|hw` | `warp` | software adapter, or the real GPU (menu-only runs) |
+| `--mode warp\|hw` | `warp` | software adapter, or the real GPU (menus and world; a driver reset is recorded as the run's end) |
 | `--timeout S` | 1800 | wall seconds for the whole session |
 | `--world-time S` | none | stop that long after the world stage is reached |
 | `--hang S` | 600 | no log line and no frame for that long ends the run as a hang |
@@ -42,7 +42,8 @@ Each run gets `D:\victory-runs\<UTC time>-<label>\`:
 - `data\`: the run's own `VICTORY_DATA_DIR` (saves, settings, `crashes.log`);
 - `crashes.log`: a copy of the run's crash log entries;
 - `dred.txt`: the host GPU failure report, with DRED data when the adapter
-  gives it (`VICTORY_D3D12_DRED=1` is always set);
+  gives it (`VICTORY_D3D12_DRED=1` is always set: in a diagnostics build
+  that forces DRED's auto-breadcrumbs and page-fault reporting on);
 - `frames\`: `VICTORY_CAPTURE` output: powers of two, every N-th frame, and
   around each frame-timed press;
 - `captures.json`: every capture's signature and difference to the one
@@ -84,7 +85,8 @@ count as near-identical (a loading spinner stays within that).
   process ended with neither's end in the log: from outside), `crash`
   (unhandled exception: `crash` holds the exception code, `module+offset`
   and detail), `device-removed` (host GPU failure: `device_removed_reason`,
-  `dred` with DRED's stopped lists and the draws/dispatches in flight),
+  `dred` with DRED's stopped lists and the draws/dispatches in flight,
+  `device_lost` below),
   `stuck`, or `timeout`, `world-time`, `hang` (vrun stopped it:
   `stopped_by_harness` is `closed` when the window's close ended the title,
   else `terminated`);
@@ -93,6 +95,18 @@ count as near-identical (a loading spinner stays within that).
   and its file, the presses on that screen without effect;
 - `seconds`, `seconds_in_world`, `frames_presented` (the log's power-of-two
   lines and the captures), `last_fps`, `black_frames_logged`;
+- `perf`: the runtime's 5-second frame lines (fps, ms/frame, ms/frame on
+  the GPU): means and the worst GPU time over the whole run and over the
+  world stage, and the last 12 lines;
+- `device_lost` (a host GPU failure, a removal exit code, or a driver
+  reset the System log recorded during the run): `hresult` and `class` of
+  the removal reason (`DXGI_ERROR_DEVICE_HUNG` is what a driver reset, TDR,
+  leaves; `DXGI_ERROR_DEVICE_REMOVED`, `_RESET`, `DRIVER_INTERNAL_ERROR`),
+  `tdr`, `os_driver_resets` (Display event 4101), `what` failed,
+  `page_fault` (address and what DRED and the runtime place around it),
+  `in_flight_ops` (DRED op and the runtime's marker text of each command
+  in flight), `unstarted_list_pipelines`, and the last `slow_submissions`
+  (with their pipelines) and `slow_commands` before the end;
 - `captures`: count, black ones, the last, the last not black, and
   `near_identical_runs` (from/to frame and seconds, length; 3 or more);
 - `presses`: per press the captures before and after, the difference

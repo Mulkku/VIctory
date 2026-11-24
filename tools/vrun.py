@@ -29,6 +29,15 @@ import zlib
 RUNS = r"D:\victory-runs"
 GAME_EXE = r"D:\gta\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
 DEVICE_REMOVED = 0x887A0005
+# Device-removed reasons by HRESULT. DEVICE_HUNG is what a driver reset
+# (TDR: a submission running for about 2 s) leaves.
+REMOVAL = {
+    0x887A0005: "DXGI_ERROR_DEVICE_REMOVED",
+    0x887A0006: "DXGI_ERROR_DEVICE_HUNG",
+    0x887A0007: "DXGI_ERROR_DEVICE_RESET",
+    0x887A0020: "DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+    0x887A002B: "DXGI_ERROR_ACCESS_DENIED",
+}
 # The window close VIctory turns into the console's suspend-and-end.
 WM_SYSCOMMAND, SC_CLOSE = 0x0112, 0xF060
 
@@ -43,6 +52,19 @@ RELAUNCHED = re.compile(r"\brelaunched\b.*\bpid=(\d+)")
 # dispatches in flight.
 STOPPED = re.compile(r"a list stopped at command (\d+) of (\d+) \(op (\d+)\)")
 IN_FLIGHT = re.compile(r"list \d+ of \d+, of its \d+: (\w+)")
+# What the commands in flight run, by their markers, and what lists that
+# never started bind.
+IN_FLIGHT_OP = re.compile(r"; command \d+ \(op (\d+)\): (.*?)(?=; |$)", re.S)
+LIST_PIPELINES = re.compile(r", its pipelines (\{.*?\}|\[.*?\])")
+HRESULT = re.compile(r"\(0x([0-9A-Fa-f]{8})\)")
+GPU_MS = re.compile(r"; (\d+(?:\.\d+)?) on the GPU")
+MS_FRAME = re.compile(r", (\d+(?:\.\d+)?) ms/frame")
+SLOW_SUBMISSION = re.compile(r"slow host submission.*?\bms=(\d+).*?\blists=(\d+)(?:.*?\bpipelines=(.*))?")
+SLOW_COMMAND = re.compile(r"slow list command, (\d+(?:\.\d+)?) ms: (.*)")
+# The OS's record of a display driver reset: "Display driver ... stopped
+# responding and has successfully recovered" (System log, Display, 4101).
+TDR_QUERY = ("*[System[Provider[@Name='Display'] and EventID=4101 "
+             "and TimeCreated[timediff(@SystemTime) <= {ms}]]]")
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -286,6 +308,12 @@ class Run:
         self.fps = None
         self.fps_at = None
         self.black_frames = 0
+        # The runtime's 5-second frame lines: (t, fps, ms/frame, GPU ms/frame).
+        self.perf = []
+        # The last slow host submissions (t, ms, lists, pipelines) and slow
+        # list commands (t, ms, op text) before the end.
+        self.slow_submissions = collections.deque(maxlen=8)
+        self.slow_commands = collections.deque(maxlen=24)
         self.input_t = None
         self.saved = []  # (frame, t) of captures the log reported
         self.captures = None
@@ -329,6 +357,14 @@ class Run:
                 self.fps = float(m.group(1))
                 self.fps_at = round(t, 1)
                 self.last_frame_change = time.monotonic()
+                ms, gpu = MS_FRAME.search(record), GPU_MS.search(record)
+                self.perf.append((round(t, 1), self.fps, float(ms.group(1)) if ms else None,
+                                  float(gpu.group(1)) if gpu else None))
+            elif m := SLOW_SUBMISSION.search(record):
+                self.slow_submissions.append((round(t, 1), int(m.group(1)), int(m.group(2)),
+                                              (m.group(3) or "").strip()))
+            elif m := SLOW_COMMAND.search(record):
+                self.slow_commands.append((round(t, 1), float(m.group(1)), m.group(2).strip()))
             elif "frame saved" in record:
                 if m := re.search(r"frame-(\d+)\.png", record):
                     n = int(m.group(1))
@@ -471,7 +507,8 @@ def main():
     p.add_argument("victory", help="path to victory.exe (a diagnostics build for warp)")
     p.add_argument("--label", required=True, help="run name (folder suffix, ledger)")
     p.add_argument("--mode", choices=["warp", "hw"], default="warp",
-                   help="warp: software adapter (default); hw: real GPU, menu-only runs")
+                   help="warp: software adapter (default); hw: real GPU, menus and world (DRED on, "
+                        "driver resets recorded)")
     p.add_argument("--timeout", type=float, default=1800, help="wall seconds for the session")
     p.add_argument("--world-time", type=float, default=None,
                    help="once in the world, stop after this many seconds there")
@@ -714,6 +751,81 @@ def stop(proc):
     return "terminated"
 
 
+def tdr_events(seconds):
+    """Display driver resets the System log recorded in the last `seconds`."""
+    try:
+        out = subprocess.run(
+            ["wevtutil", "qe", "System", f"/q:{TDR_QUERY.format(ms=int(seconds * 1000))}",
+             "/f:text", "/c:50"],
+            capture_output=True, text=True, errors="replace", timeout=60,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return len(re.findall(r"Event ID:\s*4101\b", out))
+
+
+def device_loss(run, failure, reason, code):
+    """How the host device was lost: the removal reason's HRESULT and class,
+    whether the driver reset (DEVICE_HUNG, or the OS logged a reset during
+    the run), the faulting address's surroundings, the commands in flight
+    by their op texts, and the slow work before it. None when nothing
+    failed."""
+    resets = tdr_events(run.elapsed() + 60)
+    hr = int(m.group(1), 16) if (m := HRESULT.search(reason or "")) else None
+    if hr is None and code in REMOVAL:
+        hr = code
+    if not failure and hr is None and not resets:
+        return None
+    what = re.sub(r"^.*?ERROR victory_gpu::host:\s*", "", failure.split(";", 1)[0]).strip()
+    fault = None
+    if m := re.search(r"; page fault at (0x[0-9a-f]+)(.*?)(?=; breadcrumbs|; no breadcrumbs|$)",
+                      failure, re.S):
+        fault = {"at": m.group(1),
+                 "where": [p.strip() for p in m.group(2).split(";") if p.strip()]}
+    return {
+        "hresult": f"{hr:#010x}" if hr is not None else None,
+        "class": REMOVAL.get(hr, "other") if hr is not None else None,
+        "tdr": hr == 0x887A0006 or bool(resets),
+        "os_driver_resets": resets,
+        "what": what or None,
+        "page_fault": fault,
+        "in_flight_ops": [{"op": int(m.group(1)), "marker": m.group(2).strip()}
+                          for m in IN_FLIGHT_OP.finditer(failure)],
+        "unstarted_list_pipelines": [m.group(1) for m in LIST_PIPELINES.finditer(failure)],
+        "slow_submissions": [{"at_s": t, "ms": ms, "lists": n, "pipelines": p}
+                             for t, ms, n, p in run.slow_submissions],
+        "slow_commands": [{"at_s": t, "ms": ms, "op": op} for t, ms, op in run.slow_commands],
+    }
+
+
+def perf(run):
+    """Frame and GPU time from the runtime's frame lines: the last ones, and
+    the means and worst over the world stage when it was reached."""
+    if not run.perf:
+        return None
+    world_at = run.stage_at.get("world") or run.log_stage_at.get("world")
+
+    def stats(rows):
+        if not rows:
+            return None
+        gpu = [r[3] for r in rows if r[3] is not None]
+        ms = [r[2] for r in rows if r[2] is not None]
+        return {
+            "lines": len(rows),
+            "mean_fps": round(sum(r[1] for r in rows) / len(rows), 2),
+            "mean_ms_per_frame": round(sum(ms) / len(ms), 1) if ms else None,
+            "mean_gpu_ms_per_frame": round(sum(gpu) / len(gpu), 1) if gpu else None,
+            "worst_gpu_ms_per_frame": max(gpu) if gpu else None,
+        }
+
+    return {
+        "all": stats(run.perf),
+        "world": stats([r for r in run.perf if r[0] >= world_at]) if world_at is not None else None,
+        "last": [{"at_s": t, "fps": f, "ms_per_frame": ms, "gpu_ms_per_frame": g}
+                 for t, f, ms, g in run.perf[-12:]],
+    }
+
+
 def finish(run, meta, end, code, stopped):
     args = run.args
     d = run.dir
@@ -818,6 +930,8 @@ def finish(run, meta, end, code, stopped):
             "page_fault": "page fault at" in failure,
             "in_flight": dict(in_flight.most_common()),
         } if failure else None,
+        "device_lost": device_loss(run, failure, reason, code),
+        "perf": perf(run),
         "untranslated_shaders": sum(run.untranslated.values()),
         "untranslated_by_error": dict(run.untranslated.most_common()),
         "dropped_draws": run.dropped_draws,
