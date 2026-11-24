@@ -301,6 +301,32 @@ pub enum LaneExit {
     Indirect,
 }
 
+impl LaneExit {
+    /// A branch whose condition the path into its block decides
+    /// (`when` is constant), as the jump every lane takes there.
+    pub fn decided(self) -> Self {
+        match self {
+            LaneExit::Branch { when, taken, .. } if when == Bool::TRUE => LaneExit::Jump(taken),
+            LaneExit::Branch {
+                when, not_taken, ..
+            } if when == Bool::FALSE => LaneExit::Jump(not_taken),
+            e => e,
+        }
+    }
+
+    /// The blocks a lane can go to from here ([`Self::decided`]).
+    pub fn lane_targets(self) -> impl Iterator<Item = usize> {
+        let targets = match self.decided() {
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => [Some(taken), Some(not_taken)],
+            LaneExit::End | LaneExit::Indirect => [None, None],
+        };
+        targets.into_iter().flatten()
+    }
+}
+
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {

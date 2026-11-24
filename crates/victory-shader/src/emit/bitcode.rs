@@ -159,6 +159,18 @@ pub(crate) enum Term {
     Ret,
 }
 
+/// A written block (tests): see [`Module::shape`].
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BlockShape {
+    /// Positions of the successors in layout order.
+    pub succs: Vec<usize>,
+    /// A conditional branch on a constant.
+    pub constant_branch: bool,
+    /// Per phi, its incoming values: a constant's integer, else `None`.
+    pub phis: Vec<Vec<Option<i64>>>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Block {
     phis: Vec<u32>,
@@ -481,6 +493,77 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    fn succs(&self, b: usize) -> Vec<usize> {
+        match self.blocks[b].term {
+            Some(Term::Br(t)) => vec![t],
+            Some(Term::CondBr(_, t, f)) => vec![t, f],
+            _ => vec![],
+        }
+    }
+
+    /// The blocks reachable from the entry, in reverse postorder: how they
+    /// are laid out, so every block follows its forward predecessors
+    /// (drivers take a branch to an earlier block for a loop's back edge).
+    fn reverse_postorder(&self) -> Vec<usize> {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match self.succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// The blocks reachable from the entry, in layout order (before empty
+    /// latches are folded).
+    #[cfg(test)]
+    pub fn shape(&self) -> Vec<BlockShape> {
+        let order = self.reverse_postorder();
+        let mut pos = vec![usize::MAX; self.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            pos[b] = n;
+        }
+        let int = |v: V| match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        };
+        order
+            .iter()
+            .map(|&b| {
+                let blk = &self.blocks[b];
+                BlockShape {
+                    succs: self.succs(b).into_iter().map(|s| pos[s]).collect(),
+                    constant_branch: matches!(blk.term, Some(Term::CondBr(V::Const(_), ..))),
+                    phis: blk
+                        .phis
+                        .iter()
+                        .map(|&i| match &self.insts[i as usize].op {
+                            Op::Phi(incoming) => incoming.iter().map(|&(v, _)| int(v)).collect(),
+                            _ => unreachable!("a phi"),
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -657,34 +740,8 @@ impl Module {
             }
         }
 
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
-        let succs = |b: usize| match self.blocks[b].term {
-            Some(Term::Br(t)) => vec![t],
-            Some(Term::CondBr(_, t, f)) => vec![t, f],
-            _ => vec![],
-        };
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
+        let succs = |b: usize| self.succs(b);
+        let post = self.reverse_postorder();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
