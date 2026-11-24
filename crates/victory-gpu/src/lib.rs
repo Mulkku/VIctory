@@ -56,3 +56,13 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
+
+/// For tests of the runtime's writers into title memory: the 64 KiB pages
+/// of `[start, end)` written since the last asking, as a host copy's
+/// refresh asks (guarding view memory again). `None` if the memory is
+/// neither write-watched nor a view.
+#[cfg(all(windows, feature = "test-hooks"))]
+pub fn title_writes(start: usize, end: usize) -> Option<Vec<usize>> {
+    let (now, written) = watch::writes(start, end, true)?;
+    Some(written.into_iter().filter(|&(_, w)| w == now).map(|(page, _)| page).collect())
+}

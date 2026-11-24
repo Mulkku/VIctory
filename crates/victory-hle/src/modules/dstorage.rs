@@ -943,19 +943,33 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
 /// allocation, and otherwise go through a buffer.
+///
+/// The GPU side's copies of view memory guard what they took, and a write
+/// through another view of the same pages does not trip those guards: the
+/// guards of every address showing the destination are opened before the
+/// write, and again after it, failed or not, before completion is
+/// signalled. Copies are refreshed at submission on another thread with no
+/// lock against this one, so one may guard a view again during the write.
 fn into_destination(
     request: &Request,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let at = request.destination as usize;
+        let open = || {
+            // Raw reads land through the kernel, which does not fault into
+            // the GPU side's guard on title buffers.
+            victory_gpu::kernel_will_write(at, len);
+            super::xmem::open_aliases(at, len);
+        };
+        open();
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        open();
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -966,18 +980,23 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
-    }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
-    }
+    super::xmem::open_page_views(pages, offset, len);
+    let written = (|| {
+        // Consecutive pages of one allocation (the usual case): written in
+        // place through one view.
+        if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+            return fill(window.bytes()).map(drop);
+        }
+        let mut data = vec![0; len];
+        let n = fill(&mut data)?;
+        if super::xmem::write_physical(pages, offset, &data[..n]) {
+            Ok(())
+        } else {
+            Err(E_INVALIDARG)
+        }
+    })();
+    super::xmem::open_page_views(pages, offset, len);
+    written
 }
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
@@ -1541,5 +1560,85 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// Pages the title maps twice, one view to write through and one for
+    /// the GPU (as Grand Theft Auto VI streams its acceleration
+    /// structures): a host copy took the GPU's view and guards it. Every
+    /// request into the other view, or into the pages themselves, leaves
+    /// the GPU view's blocks reported written, also when it fails after
+    /// writing part of its destination.
+    #[test]
+    fn requests_open_the_guards_of_every_view_of_their_pages() {
+        use crate::modules::xmem;
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let reserve = || {
+            xmem::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+                0,
+                0x04,
+            )
+        };
+        let (cpu, gpu) = (reserve(), reserve());
+        for view in [cpu, gpu] {
+            assert_eq!(xmem::XMemMapPhysicalPages(view, 2, pages.as_ptr()), view);
+        }
+        let gpu_at = gpu as usize;
+        let written = || victory_gpu::title_writes(gpu_at, gpu_at + 2 * PAGE).expect("a view");
+        // SAFETY: both pages are mapped (read-only where guarded).
+        let seen = |at: usize, n: usize| unsafe { std::slice::from_raw_parts((gpu_at + at) as *const u8, n) }.to_vec();
+        // The copy takes both blocks; nothing written since.
+        assert_eq!(written().len(), 2);
+        assert_eq!(written(), []);
+
+        // An address destination in the CPU's view, from memory.
+        let plain = pattern(100);
+        let r = request(
+            MEMORY_SOURCE,
+            cpu.wrapping_byte_add(PAGE + 8),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(seen(PAGE + 8, 100), plain);
+        assert_eq!(written(), [gpu_at / PAGE + 1]);
+
+        // A raw read that ends early: part of the destination is written,
+        // then the request fails.
+        let (_dir, file) = file_with(&plain);
+        let r = request(0, cpu, 200, file.cast_const(), 0, 200);
+        assert!(execute(&r).is_err());
+        assert_eq!(seen(0, 100), plain, "written before failing");
+        assert_eq!(written(), [gpu_at / PAGE]);
+
+        // Page destinations, written through a view of our own.
+        let reversed: Vec<u8> = plain.iter().rev().copied().collect();
+        let mut second = [pages[1]];
+        let mut r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            second.as_mut_ptr().cast(),
+            reversed.len(),
+            reversed.as_ptr().cast(),
+            0,
+            reversed.len(),
+        );
+        r.page_offset = 8;
+        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(seen(PAGE + 8, 100), reversed);
+        assert_eq!(written(), [gpu_at / PAGE + 1]);
+
+        for view in [cpu, gpu] {
+            assert_eq!(xmem::XMemMapPhysicalPages(view, 2, std::ptr::null()), view);
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
